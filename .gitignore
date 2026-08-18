@@ -1,0 +1,15 @@
+# 构建目录
+build/
+build_fast/
+
+# 编译产物
+*.exe
+*.obj
+*.o
+*.a
+
+# 本地运行时/调试产物（日志与数据）
+*.log
+*.bmp
+*.raw
+*.bin

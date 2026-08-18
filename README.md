@@ -93,16 +93,17 @@ fitsplat input.png --splats 350000 --iters 15000 --width 800 --embed 1 --residua
 
 ### 2. Render — `fitsplat_gl`
 
-The renderer loads `input.glsl` from the directory of the executable. Drop the exported GLSL next to `fitsplat_gl.exe` and run:
+The renderer takes the GLSL file either as a positional argument, via `--input`, or — if omitted — loads `input.glsl` from the directory of the executable:
 
 ```powershell
-fitsplat_gl.exe                 # real-time window (ESC to quit)
-fitsplat_gl.exe --export out    # headless: write out.png (16-bit) + out.bmp (8-bit), then exit
+fitsplat_gl.exe input.glsl          # real-time window (ESC to quit)
+fitsplat_gl.exe --input input.glsl  # same, explicit option
+fitsplat_gl.exe input.glsl --export out   # headless: write out.png (16-bit) + out.bmp (8-bit), then exit
 ```
 
 | Option | Description |
 |---|---|
-| *(none)* | open the real-time preview window, letterboxed to the canvas aspect ratio |
+| `<file.glsl>` / `--input FILE` | GLSL to render (default: `input.glsl` next to the exe) |
 | `--export BASE` | render one frame headlessly, save `BASE.png` (16-bit) + `BASE.bmp`, then exit |
 | `--dump` | debug: dump the FBO to `fbodump.raw` |
 | `--dumpwin` | debug: dump the window frame to `windump.raw` |

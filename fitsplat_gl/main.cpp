@@ -524,11 +524,13 @@ int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IONBF, 0);
     bool dump = false, dumpwin = false;
-    std::string exportBase;
+    std::string exportBase, inputPath;   // inputPath: 显式指定 GLSL 文件（--input <file> 或位置参数）
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--dump") == 0) dump = true;
-        if (strcmp(argv[i], "--dumpwin") == 0) dumpwin = true;
-        if (strcmp(argv[i], "--export") == 0 && i + 1 < argc) exportBase = argv[++i];   // 离线导出：base.png(16bit)+base.bmp
+        else if (strcmp(argv[i], "--dumpwin") == 0) dumpwin = true;
+        else if (strcmp(argv[i], "--input") == 0 && i + 1 < argc) inputPath = argv[++i];   // 显式指定 GLSL 文件
+        else if (strcmp(argv[i], "--export") == 0 && i + 1 < argc) exportBase = argv[++i]; // 离线导出：base.png(16bit)+base.bmp
+        else if (argv[i][0] != '-') inputPath = argv[i];   // 位置参数：直接给 GLSL 文件路径
     }
     if (!glfwInit()) { printf("glfwInit 失败\n"); return 1; }
 
@@ -548,14 +550,19 @@ int main(int argc, char** argv)
     glfwGetFramebufferSize(win, &g_winW, &g_winH);
     printf("窗口 framebuffer: %dx%d\n", g_winW, g_winH);
 
-    // ---- 加载 input.glsl 解析画布尺寸 ----
-    std::string exeDir = ExeDir();
+    // ---- 加载 GLSL 解析画布尺寸 ----
+    // 优先用命令行指定的文件（--input <file> 或位置参数），否则回退 exe 同目录 input.glsl
     std::vector<unsigned char> glslBuf;
     std::string glslPath;
-    for (const auto& p : { exeDir + "/input.glsl", std::string("input.glsl") }) {
-        if (ReadFileBin(p, glslBuf)) { glslPath = p; break; }
+    if (!inputPath.empty()) {
+        if (ReadFileBin(inputPath, glslBuf)) glslPath = inputPath;
+    } else {
+        std::string exeDir = ExeDir();
+        for (const auto& p : { exeDir + "/input.glsl", std::string("input.glsl") }) {
+            if (ReadFileBin(p, glslBuf)) { glslPath = p; break; }
+        }
     }
-    if (glslPath.empty()) { printf("未找到 input.glsl\n"); return 1; }
+    if (glslPath.empty()) { printf("未找到 GLSL 文件（用 --input <file> 或位置参数指定，或放到 exe 同目录 input.glsl）\n"); return 1; }
     std::string glsl((const char*)glslBuf.data(), glslBuf.size());
     if (!ParseImgSize(glsl, g_imgW, g_imgH)) {
         printf("input.glsl 中未找到 IMG_W/IMG_H 常量\n"); return 1;

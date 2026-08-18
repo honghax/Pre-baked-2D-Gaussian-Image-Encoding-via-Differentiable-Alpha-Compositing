@@ -5,5 +5,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_executable(fitsplat fitsplat.cpp)
 target_include_directories(fitsplat PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../third_party/stb)
 if(MSVC)
-  target_compile_options(fitsplat PRIVATE /O2 /fp:fast /utf-8)
+  # /O2 仅用于非 Debug 配置：VS Debug 默认带 /Od /RTC1，与 /O2 互斥（D8016）
+  target_compile_options(fitsplat PRIVATE $<$<NOT:$<CONFIG:Debug>>:/O2> /fp:fast /utf-8)
 endif()

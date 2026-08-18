@@ -1,0 +1,119 @@
+# Media-Art Tool License (MATL) v1.0
+
+Copyright © 2026 honghax. All rights reserved.
+
+This license applies to the software package "Pre-baked 2D Gaussian Image
+Encoding via Differentiable Alpha Compositing" (hereinafter "the Work"),
+authored by honghax (hereinafter "the Author").
+
+## Preamble
+
+The Work is a media-art tool primarily designed to encode images as parametric
+representations, and is released as an artistic instrument whose value is
+inherently artistic. This license is written to preserve the Author's
+ownership of the Work and of everything derived from it, while voluntarily
+releasing Derivatives created in non-commercial, non-training contexts.
+
+## 1. Definitions
+
+1.1 **"Work"** means the software, source code, documentation, build scripts,
+and all accompanying materials that constitute this repository.
+
+1.2 **"Derivative"** means any result created by, or derived from, the Work or
+from another Derivative — including but not limited to rendered images, media,
+artworks, modifications, adaptations, translations, and merged or combined
+works.
+
+1.3 **"Author"** means the copyright holder of the Work.
+
+1.4 **"Commercial Project"** means any project or activity that generates,
+directly or indirectly, monetary or other economic benefit, including but not
+limited to sales, licensing, subscriptions, advertising revenue, donations,
+funding, sponsorships, commission, or services rendered for compensation.
+
+1.5 **"Model Training"** means the use of the Work or any Derivative, in whole
+or in part, as input, target, supervision signal, or any other component in
+the training, fine-tuning, distillation, or construction of any algorithm,
+neural network, or machine-learning model, regardless of purpose or outcome.
+
+## 2. Ownership
+
+The Author owns the Work in its entirety, including its copyright and all
+related rights. The Author likewise owns every Derivative, including all
+modifications and adaptations of the Work. Nothing in this license transfers,
+assigns, or otherwise relinquishes ownership of the Work or of any Derivative
+to any licensee. All ownership rights not expressly granted herein are
+reserved by the Author.
+
+## 3. Permitted Use — Voluntary Release of Rights and Liability
+
+The Author voluntarily waives, to the fullest extent permitted by law, all
+rights to, and all responsibility for, any Derivative created by using the
+Work where such use satisfies **both** of the following conditions:
+
+   (a) the use does **not** constitute Model Training of any nature; **and**
+   (b) the use does **not** serve, directly or indirectly, a Commercial
+       Project.
+
+Derivatives falling under this section may be freely created, modified,
+exhibited, published, and distributed by the user without further consent
+from the Author, and the Author assumes no liability whatsoever in connection
+with them.
+
+## 4. Restricted Use — Ownership by the Author
+
+Any Derivative created by using the Work where the use involves **either** of
+the following:
+
+   (a) Model Training of any nature; **or**
+   (b) a directly or indirectly profitable Commercial Project,
+
+shall be owned by the Author. Without the Author's prior **written
+permission**, such a Derivative may not be:
+
+   (i) used in any directly or indirectly profitable Commercial Project; or
+   (ii) used for Model Training of any nature.
+
+Requests for written permission must be addressed to the Author and are
+granted or withheld at the Author's sole discretion, and may be conditioned
+on such terms as the Author deems appropriate.
+
+## 5. Distribution of the Work Itself
+
+Distribution of the Work itself — in source or binary form — is permitted
+only if this license and the copyright notice are retained in their entirety
+and included with every copy or substantial portion of the Work.
+
+## 6. No Warranty and Limitation of Liability
+
+The Work is provided "AS IS", without warranty of any kind, express or
+implied, including but not limited to the warranties of merchantability,
+fitness for a particular purpose, and non-infringement. In no event shall the
+Author be liable for any claim, damages, or other liability — whether in an
+action of contract, tort, or otherwise — arising from, out of, or in
+connection with the Work, its Derivatives, or their use, except as expressly
+stated in Section 3.
+
+## 7. Termination
+
+This license takes effect upon the user's receipt or use of the Work. The
+rights granted herein terminate automatically if the user violates any
+provision of this license. Upon termination, the user must immediately cease
+all use of the Work and of any Derivative governed by this license.
+
+## 8. Miscellaneous
+
+8.1 The rights granted under this license are non-exclusive and
+non-transferable.
+
+8.2 This license does not grant permission to use the Author's name,
+trademarks, or likeness in any advertising, publicity, or endorsement, unless
+expressly authorized in writing by the Author.
+
+8.3 The Author may publish revised versions of this license; each version
+bears a distinct version number. A user's continued use of the Work after a
+new version is published constitutes acceptance of the revised terms.
+
+8.4 This license shall be governed by and construed in accordance with the
+laws of the jurisdiction in which the Author resides, without regard to
+conflict-of-law provisions.

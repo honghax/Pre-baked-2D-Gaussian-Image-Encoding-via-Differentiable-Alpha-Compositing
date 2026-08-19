@@ -184,7 +184,8 @@ uniform sampler2D uSpl;   // NS*3 个 texel 展平为 uTexW 宽的二维纹理
 uniform int    uTexW;     // 展平宽度（<< GL_MAX_TEXTURE_SIZE，避免大 NS 纹理单维超限）
 uniform int    uBase;     // 动画增量模式：实例偏移（默认 0 = 从第 0 个开始）
 uniform float uTime;
-uniform float uCap;   // 包围盒偏移上限（画布短边*0.35，对齐 playpiano 的 ex/ey clamp 防铺满屏幕）
+uniform float uCap;   // 包围盒偏移上限（放大坐标系下 = 长边*scale）
+uniform float uScale; // --scale N：高清直渲放大系数（画布坐标 ×N，GPU 直接在高分辨率下栅格化）
 out vec2 vMu; out vec2 vSC; out vec2 vS; out vec3 vCol; out float vA;
 vec4 fetchParam(int ti){ return texelFetch(uSpl, ivec2(ti % uTexW, ti / uTexW), 0); }
 void main(){
@@ -206,9 +207,10 @@ void main(){
     vec2 off = vec2(dx, dy);
     float lo = length(off);
     if (lo > uCap) off *= uCap / lo;
-    vec2 q = A.xy + off;
+    // 高清直渲：位置/尺寸/包围盒整体乘 uScale，在放大坐标系下栅格化（连续函数的高密度采样）
+    vec2 q = uScale * (A.xy + off);
 
-    vMu = A.xy; vSC = C.xy; vS = A.zw; vCol = B.rgb; vA = B.w;
+    vMu = uScale * A.xy; vSC = C.xy; vS = uScale * A.zw; vCol = B.rgb; vA = B.w;
     gl_Position = vec4(qToClip(q), 0.0, 1.0);
 }
 )";
@@ -497,11 +499,15 @@ static void ExportAll(const char* base, int w, int h)
     glReadPixels(0, 0, w, h, GL_RGBA, GL_FLOAT, px.data());
     // 残差修正层叠加（与 pass2 相同逻辑）。注意：glReadPixels 行序底部优先（row0=图像底部），
     // 而 kRes 顶部优先（row0=图像顶部），叠加时必须行翻转对齐。
+    // scale>1（高清直渲导出）时按比例映射回画布分辨率（最近邻取整 + clamp）。
     if (!g_resVals.empty()) {
+        int cw = (int)g_imgW, ch = (int)g_imgH;
         for (int j = 0; j < h; ++j)
             for (int i = 0; i < w; ++i) {
                 size_t pr = (size_t)j * w + i;             // px 行 j（底部优先）
-                size_t rr = (size_t)(h - 1 - j) * w + i;   // kRes 行（顶部优先）
+                int cx = std::max(0, std::min((int)((double)i * cw / w), cw - 1));
+                int cy = std::max(0, std::min((int)((double)j * ch / h), ch - 1));
+                size_t rr = (size_t)(ch - 1 - cy) * cw + cx;   // kRes 行（顶部优先）
                 unsigned v = g_resVals[rr];
                 for (int c = 0; c < 3; ++c) {
                     int vc = (v >> (c * 4)) & 15;
@@ -529,6 +535,7 @@ int main(int argc, char** argv)
     int animMode = 0;      // --anim：动画模式，按 kData 数组顺序渐进绘制（混沌浮现效果）
     int animRate = 10000;  // --anim-rate N：动画每秒新增 splat 数（默认 10000）
     int animFps = 60;      // --anim-fps 30|60：动画节奏（默认 60；30 时每帧推进量翻倍，总时长一致）
+    float scale = 1.0f;    // --scale N：高清直渲放大系数（pass1 渲染目标 = 画布×N，splat 坐标×N）
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--dump") == 0) dump = true;
         else if (strcmp(argv[i], "--dumpwin") == 0) dumpwin = true;
@@ -537,10 +544,12 @@ int main(int argc, char** argv)
         else if (strcmp(argv[i], "--anim") == 0) animMode = 1;                             // 启动动画模式
         else if (strcmp(argv[i], "--anim-rate") == 0 && i + 1 < argc) animRate = atoi(argv[++i]);
         else if (strcmp(argv[i], "--anim-fps") == 0 && i + 1 < argc) animFps = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--scale") == 0 && i + 1 < argc) scale = (float)atof(argv[++i]);
         else if (argv[i][0] != '-') inputPath = argv[i];   // 位置参数：直接给 GLSL 文件路径
     }
     if (animFps != 30 && animFps != 60) animFps = 60;   // 只允许 30/60，非法值回落 60
     if (animRate <= 0) animRate = 10000;
+    if (scale <= 0.f) scale = 1.0f;   // --scale 非法值回落 1（1:1 画布渲染）
     if (!glfwInit()) { printf("glfwInit 失败\n"); return 1; }
 
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -576,9 +585,14 @@ int main(int argc, char** argv)
     if (!ParseImgSize(glsl, g_imgW, g_imgH)) {
         printf("input.glsl 中未找到 IMG_W/IMG_H 常量\n"); return 1;
     }
+    // 高清直渲：pass1 渲染目标 = 画布 × scale（splat 坐标在 VS 里乘 uScale 对齐）
+    int rW = (int)std::max(1, (int)llroundf(g_imgW * scale));
+    int rH = (int)std::max(1, (int)llroundf(g_imgH * scale));
+    if (scale != 1.0f)
+        printf("高清直渲: --scale %.2f -> pass1 渲染目标 %dx%d\n", scale, rW, rH);
     printf("已加载: %s (画布 %.0fx%.0f)\n", glslPath.c_str(), g_imgW, g_imgH);
-    // 窗口按图片尺寸创建（逻辑像素 1:1；framebuffer 受系统缩放影响，pass2 letterbox 自动适配）
-    glfwSetWindowSize(win, (int)g_imgW, (int)g_imgH);
+    // 窗口按渲染目标尺寸创建（逻辑像素 1:1；framebuffer 受系统缩放影响，pass2 letterbox 自动适配）
+    glfwSetWindowSize(win, rW, rH);
     glfwGetFramebufferSize(win, &g_winW, &g_winH);
     printf("窗口 framebuffer: %dx%d\n", g_winW, g_winH);
 
@@ -670,8 +684,10 @@ int main(int argc, char** argv)
                 }
             glGenTextures(1, &resTex);
             glBindTexture(GL_TEXTURE_2D, resTex);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            // LINEAR：scale>1 高清直渲时残差纹理被放大采样，线性插值更平滑；
+            // 1:1 时采样点恰在纹素中心，与 NEAREST 等价。
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)g_imgW, (GLsizei)g_imgH, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
             printf("残差修正层: 已加载 kRes (%dx%d, RGBA8)\n", (int)g_imgW, (int)g_imgH);
         } else {
@@ -709,14 +725,15 @@ int main(int argc, char** argv)
     Prog pSplat = MakeProg(kVSSplat, kFSSplat, "splat");
     Prog pPresent = MakeProg(kVSFull, kFSPresent, "present");
     if (!pSplat.id || !pPresent.id) return 1;
-    GLint uBaseLoc = glGetUniformLocation(pSplat.id, "uBase");   // 动画增量：实例偏移
+    GLint uBaseLoc = glGetUniformLocation(pSplat.id, "uBase");     // 动画增量：实例偏移
+    GLint uScaleLoc = glGetUniformLocation(pSplat.id, "uScale");   // 高清直渲：坐标放大系数
 
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
 
-    // 缓存 FBO 固定为画布尺寸（不随窗口变化），pass2 再做 letterbox 采样，
-    // 这样窗口 framebuffer 尺寸（受屏幕/边框影响，如 1017/1061）不影响正确性。
-    CreateTargets((int)g_imgW, (int)g_imgH);
+    // 缓存 FBO 固定为渲染目标尺寸 rW×rH（= 画布×scale，不随窗口变化），
+    // pass2 再做 letterbox 采样，这样窗口 framebuffer 尺寸（受屏幕/边框影响）不影响正确性。
+    CreateTargets(rW, rH);
 
     // ---- 渲染循环 ----
     bool cacheReady = false;        // 非动画：FBO 是否已渲染完成
@@ -730,18 +747,19 @@ int main(int argc, char** argv)
     // 持久 FBO 上叠加（RGBA32F 全精度）≡ 一次性按序全量渲染。动画每帧只画新增段，
     // 渲染开销恒定 O(animRate)，不会随累计量增长（重绘方案是 ΣN ≈ N²/2 的二次方）。
     auto DrawSeg = [&](int base, int cnt, bool doClear) {
-        glViewport(0, 0, (int)g_imgW, (int)g_imgH);
+        glViewport(0, 0, rW, rH);
         glBindFramebuffer(GL_FRAMEBUFFER, fboA);
         if (doClear) { glClearColor(0.f, 0.f, 0.f, 0.f); glClear(GL_COLOR_BUFFER_BIT); }
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glUseProgram(pSplat.id);
-        glUniform2f(pSplat.res, g_imgW, g_imgH);
+        glUniform2f(pSplat.res, (float)rW, (float)rH);
         glUniform2f(pSplat.sz, 1.f, 1.f);          // 画布像素 -> 画布像素（1:1）
         glUniform2f(pSplat.off, 0.f, 0.f);
-        // 上限按画布长边（覆盖正常 splat 的 3σ 包围盒；此前硬编码 1080*0.35=378，
+        // 上限按放大坐标系长边（覆盖正常 splat 的 3σ 包围盒；此前硬编码 1080*0.35=378，
         // 在大画布（800x1165）上会截断大 splat 的包围盒导致渲染错位/缺失）
-        glUniform1f(pSplat.cap, std::fmax(g_imgW, g_imgH));
+        glUniform1f(pSplat.cap, (float)std::max(rW, rH));
+        glUniform1f(uScaleLoc, scale);
         glUniform1i(pSplat.spl, 0);
         glUniform1i(pSplat.texW, kTexW);
         glUniform1i(uBaseLoc, base);
@@ -801,9 +819,9 @@ int main(int argc, char** argv)
         {
             cacheReady = true;
             DrawSeg(0, (int)NS, true);
-            if (dump) DumpFBO("fbodump.raw", (int)g_imgW, (int)g_imgH);
+            if (dump) DumpFBO("fbodump.raw", rW, rH);
             if (!exportBase.empty()) {
-                ExportAll(exportBase.c_str(), (int)g_imgW, (int)g_imgH);   // 离线导出：读回 float32 -> PNG16/BMP24
+                ExportAll(exportBase.c_str(), rW, rH);   // 离线导出：读回 float32 -> PNG16/BMP24（scale>1 即高清直渲导出）
                 glfwSetWindowShouldClose(win, GLFW_TRUE);
             }
         }
@@ -815,7 +833,7 @@ int main(int argc, char** argv)
         glUniform2f(pPresent.res, (float)W, (float)H);
         glUniform2f(pPresent.sz, sW, sW);
         glUniform2f(pPresent.off, offXW, offYW);
-        glUniform2f(pPresent.imgSz, g_imgW, g_imgH);
+        glUniform2f(pPresent.imgSz, (float)rW, (float)rH);   // 采样目标 = pass1 渲染目标尺寸（画布×scale）
         glUniform1i(pPresent.tex, 0);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, tA);

@@ -38,12 +38,9 @@ static inline float ClampF(float x, float lo, float hi) { return x < lo ? lo : (
 static int g_winW = 1920, g_winH = 1080;
 static float g_imgW = 320.f, g_imgH = 180.f;
 static std::vector<unsigned> g_resVals;   // 残差修正层 kRes（供 ExportAll 叠加，与 pass2 逻辑一致）
-// 裁剪视口（右键无损放大）：画布像素矩形 [x0,y0,x0+w,y0+h]；全图 = (0,0,imgW,imgH)。
-// pass1 坐标做 crop 变换（平移+缩放），裁剪区域铺满 FBO —— 高斯是连续函数，
-// 这是"高密度采样"而非插值放大，故无损。右键放大 4 倍，中键/按 R 恢复全图。
-static float g_cropX = 0.f, g_cropY = 0.f, g_cropW = 0.f, g_cropH = 0.f;
-static bool  g_cropDirty = false;   // 右键回调置位，主循环重渲 FBO
-static int   g_fbW = 0, g_fbH = 0;  // 渲染目标尺寸（= 画布×scale），供鼠标回调换算坐标
+static float g_zoom = 1.0f;               // 区域放大镜：放大倍数（1=关闭；N>1 只渲染画布 1/N 区域，任意倍数不受屏幕限制）
+static float g_camX = 0.f, g_camY = 0.f;  // 区域放大镜：区域中心（画布坐标，像素）
+static double g_scrollY = 0.0;            // 滚轮缩放累计（回调累加，帧内消费）
 
 // ---- 工具 ----
 static std::string ExeDir()
@@ -192,8 +189,6 @@ uniform int    uBase;     // 动画增量模式：实例偏移（默认 0 = 从�
 uniform float uTime;
 uniform float uCap;   // 包围盒偏移上限（放大坐标系下 = 长边*scale）
 uniform float uScale; // --scale N：高清直渲放大系数（画布坐标 ×N，GPU 直接在高分辨率下栅格化）
-uniform vec2  uCropO; // 裁剪原点（画布像素）：右键无损放大时整体平移
-uniform float uZoom;  // 裁剪放大倍数 = 渲染目标宽 / 裁剪宽（画布像素 -> FBO 像素）
 out vec2 vMu; out vec2 vSC; out vec2 vS; out vec3 vCol; out float vA;
 vec4 fetchParam(int ti){ return texelFetch(uSpl, ivec2(ti % uTexW, ti / uTexW), 0); }
 void main(){
@@ -216,10 +211,9 @@ void main(){
     float lo = length(off);
     if (lo > uCap) off *= uCap / lo;
     // 高清直渲：位置/尺寸/包围盒整体乘 uScale，在放大坐标系下栅格化（连续函数的高密度采样）
-    // 裁剪：整体平移 -uCropO 再乘 uZoom，使裁剪区域铺满 FBO —— 右键无损放大
-    vec2 q = uScale * (A.xy + off - uCropO) * uZoom;
+    vec2 q = uScale * (A.xy + off);
 
-    vMu = uScale * (A.xy - uCropO) * uZoom; vSC = C.xy; vS = uScale * A.zw * uZoom; vCol = B.rgb; vA = B.w;
+    vMu = uScale * A.xy; vSC = C.xy; vS = uScale * A.zw; vCol = B.rgb; vA = B.w;
     gl_Position = vec4(qToClip(q), 0.0, 1.0);
 }
 )";
@@ -246,17 +240,15 @@ uniform sampler2D uTex;
 uniform sampler2D uResTex;   // 残差修正层（普通 RGBA8，存 v*16，v=4bit 量化值 0-15）
 uniform int uHasRes;         // 1=有残差层，0=无
 uniform vec2 uImgSz;
-uniform vec4 uCrop;          // (x0,y0,w,h) 画布像素裁剪区域；全图=(0,0,imgW,imgH)
 void main(){
     vec2 q = fragQ();
-    // FBO 内容 = 裁剪区域铺满，uTex 采样映射到裁剪区域内（y 翻转：FBO 底部优先）
-    vec2 qt = (q - uCrop.xy) / uCrop.zw;
-    vec2 uv = vec2(qt.x, 1.0 - qt.y);
+    vec2 uv = vec2(q.x / uImgSz.x, (uImgSz.y - q.y) / uImgSz.y);
     vec3 col = clamp(texture(uTex, uv).rgb, 0.0, 1.0);
     if (uHasRes == 1) {
-        // 残差纹理是画布尺寸，用画布坐标 q 采样（不随裁剪缩放，残差本身是低频补充）
-        vec2 uvr = vec2(q.x / uImgSz.x, (uImgSz.y - q.y) / uImgSz.y);
-        vec3 res = texture(uResTex, uvr).rgb * (128.0 / 240.0) - (1024.0 / 3825.0);
+        // 残差纹理与缓存 FBO 同序（row0=图像顶部，上传不翻转），uv 采样与 uTex 相同；
+        // 纹理存 t=v*16，texture 返回 t/255；解码 res = (v-8)*(128/15)/255
+        //   = (t/16 - 8)*(128/15)/255 = (t*255/16 - 8)*(128/3825) = t*0.5333 - 0.2677
+        vec3 res = texture(uResTex, uv).rgb * (128.0 / 240.0) - (1024.0 / 3825.0);
         col = clamp(col + res, 0.0, 1.0);
     }
     FragColor = vec4(col, 1.0);
@@ -268,7 +260,6 @@ struct Prog
 {
     GLuint id = 0;
     GLint res = -1, sz = -1, off = -1, time = -1, cap = -1, spl = -1, tex = -1, texW = -1, imgSz = -1;
-    GLint cropO = -1, zoom = -1, crop = -1;   // 裁剪视口（右键无损放大）
 };
 
 static bool CheckShader(GLuint sh, const char* name)
@@ -325,9 +316,6 @@ static Prog MakeProg(const char* vsSrc, const char* fsSrc, const char* name)
     P.tex  = glGetUniformLocation(P.id, "uTex");
     P.texW = glGetUniformLocation(P.id, "uTexW");
     P.imgSz = glGetUniformLocation(P.id, "uImgSz");
-    P.cropO = glGetUniformLocation(P.id, "uCropO");
-    P.zoom  = glGetUniformLocation(P.id, "uZoom");
-    P.crop  = glGetUniformLocation(P.id, "uCrop");
     return P;
 }
 
@@ -338,39 +326,11 @@ static void FramebufferSizeCallback(GLFWwindow* win, int w, int h)
     g_winH = h;
 }
 
-// 鼠标回调：右键点击 -> 以点击处为中心裁剪区域缩至 1/1.5（每次放大 1.5 倍）；
-// 中键点击 -> 恢复全图。坐标换算：窗口客户区(glfw, y向下) -> framebuffer -> 画布。
-static GLFWwindow* g_cbWin = nullptr;
-static void MouseButtonCallback(GLFWwindow* win, int button, int action, int /*mods*/)
+// 区域放大镜：滚轮缩放事件累加（帧内消费并应用到 g_zoom）
+static void ScrollCallback(GLFWwindow* win, double x, double y)
 {
-    if (action != GLFW_PRESS) return;
-    if (g_cropW <= 0.f || g_cropH <= 0.f) return;   // 画布尺寸未初始化
-    double mx, my;
-    glfwGetCursorPos(win, &mx, &my);
-    int winW = 0, winH = 0;
-    glfwGetWindowSize(win, &winW, &winH);
-    if (winW <= 0 || winH <= 0) winW = g_winW, winH = g_winH;
-    float fx = (float)(mx * g_winW / (double)winW);   // framebuffer 像素坐标（y 向下）
-    float fy = (float)(my * g_winH / (double)winH);
-    float sW = std::fmin(g_winW / g_imgW, g_winH / g_imgH);   // 画板适配系数（与 pass2 一致）
-    float offX = (g_winW - g_imgW * sW) * 0.5f, offY = (g_winH - g_imgH * sW) * 0.5f;
-    float qx = (fx - offX) / sW, qy = (fy - offY) / sW;       // 画布坐标（顶部优先）
-    if (button == GLFW_MOUSE_BUTTON_RIGHT) {
-        // 以点击处为中心，裁剪区域缩至 1/1.5（每次放大 1.5 倍），clamp 到画布内；
-        // 最小区域 8px，防止放大过深导致裁剪区域趋近 0
-        float nw = std::max(g_cropW / 1.5f, 8.f), nh = std::max(g_cropH / 1.5f, 8.f);
-        g_cropX = qx - nw * 0.5f;
-        g_cropY = qy - nh * 0.5f;
-        g_cropX = ClampF(g_cropX, 0.f, g_imgW - nw);
-        g_cropY = ClampF(g_cropY, 0.f, g_imgH - nh);
-        g_cropW = nw; g_cropH = nh;
-        g_cropDirty = true;
-        printf("crop 放大: [%.0f,%.0f %dx%d] (%.0fx)\n", g_cropX, g_cropY, (int)nw, (int)nh, g_imgW / nw);
-    } else if (button == GLFW_MOUSE_BUTTON_MIDDLE) {
-        g_cropX = 0.f; g_cropY = 0.f; g_cropW = g_imgW; g_cropH = g_imgH;
-        g_cropDirty = true;
-        printf("crop 恢复全图\n");
-    }
+    (void)win; (void)x;
+    g_scrollY += y;
 }
 
 // ---- 渲染目标 ----
@@ -551,12 +511,15 @@ static void ExportAll(const char* base, int w, int h)
     // 而 kRes 顶部优先（row0=图像顶部），叠加时必须行翻转对齐。
     // scale>1（高清直渲导出）时按比例映射回画布分辨率（最近邻取整 + clamp）。
     if (!g_resVals.empty()) {
-        int cw = (int)g_imgW, ch = (int)g_imgH;
+        // 区域放大镜感知：FBO 像素 (i,j) 对应画布坐标 ox+((i+0.5)/w)*cw（默认 zoom=1 时即全画布）
+        float ox = g_camX - g_imgW * 0.5f / g_zoom;
+        float oy = g_camY - g_imgH * 0.5f / g_zoom;
+        float cw = g_imgW / g_zoom, ch = g_imgH / g_zoom;
         for (int j = 0; j < h; ++j)
             for (int i = 0; i < w; ++i) {
                 size_t pr = (size_t)j * w + i;             // px 行 j（底部优先）
-                int cx = std::max(0, std::min((int)((double)i * cw / w), cw - 1));
-                int cy = std::max(0, std::min((int)((double)j * ch / h), ch - 1));
+                int cx = std::max(0, std::min((int)((i + 0.5f) * cw / w + ox), (int)cw - 1));
+                int cy = std::max(0, std::min((int)((j + 0.5f) * ch / h + oy), (int)ch - 1));
                 size_t rr = (size_t)(ch - 1 - cy) * cw + cx;   // kRes 行（顶部优先）
                 unsigned v = g_resVals[rr];
                 for (int c = 0; c < 3; ++c) {
@@ -586,6 +549,8 @@ int main(int argc, char** argv)
     int animRate = 10000;  // --anim-rate N：动画每秒新增 splat 数（默认 10000）
     int animFps = 60;      // --anim-fps 30|60：动画节奏（默认 60；30 时每帧推进量翻倍，总时长一致）
     float scale = 1.0f;    // --scale N：高清直渲放大系数（pass1 渲染目标 = 画布×N，splat 坐标×N）
+    float zoomArg = 1.0f;  // --zoom N：区域放大镜倍数（1=关闭；N>1 只渲染画布 1/N 区域，任意倍数不受屏幕限制）
+    float zoomX = -1.f, zoomY = -1.f;   // --zoom-x CX / --zoom-y CY：区域中心（画布坐标，默认画布中心）
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--dump") == 0) dump = true;
         else if (strcmp(argv[i], "--dumpwin") == 0) dumpwin = true;
@@ -595,11 +560,15 @@ int main(int argc, char** argv)
         else if (strcmp(argv[i], "--anim-rate") == 0 && i + 1 < argc) animRate = atoi(argv[++i]);
         else if (strcmp(argv[i], "--anim-fps") == 0 && i + 1 < argc) animFps = atoi(argv[++i]);
         else if (strcmp(argv[i], "--scale") == 0 && i + 1 < argc) scale = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "--zoom") == 0 && i + 1 < argc) zoomArg = (float)atof(argv[++i]);       // 区域放大镜倍数
+        else if (strcmp(argv[i], "--zoom-x") == 0 && i + 1 < argc) zoomX = (float)atof(argv[++i]);       // 区域中心 x（画布坐标）
+        else if (strcmp(argv[i], "--zoom-y") == 0 && i + 1 < argc) zoomY = (float)atof(argv[++i]);       // 区域中心 y（画布坐标）
         else if (argv[i][0] != '-') inputPath = argv[i];   // 位置参数：直接给 GLSL 文件路径
     }
     if (animFps != 30 && animFps != 60) animFps = 60;   // 只允许 30/60，非法值回落 60
     if (animRate <= 0) animRate = 10000;
     if (scale <= 0.f) scale = 1.0f;   // --scale 非法值回落 1（1:1 画布渲染）
+    if (zoomArg < 1.f) zoomArg = 1.0f;   // --zoom 非法值回落 1（关闭放大镜）
     if (!glfwInit()) { printf("glfwInit 失败\n"); return 1; }
 
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -613,8 +582,7 @@ int main(int argc, char** argv)
     glfwSwapInterval(1);
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) { printf("glad 失败\n"); return 1; }
     glfwSetFramebufferSizeCallback(win, FramebufferSizeCallback);
-    g_cbWin = win;
-    glfwSetMouseButtonCallback(win, MouseButtonCallback);   // 右键无损放大 / 中键恢复全图
+    glfwSetScrollCallback(win, ScrollCallback);
     // 窗口客户区（framebuffer）≠ 请求的窗口外部尺寸（含标题栏/边框）。
     // 必须以实际 framebuffer 尺寸为准，否则 FBO/视口与窗口不匹配会导致显示错位。
     glfwGetFramebufferSize(win, &g_winW, &g_winH);
@@ -637,8 +605,12 @@ int main(int argc, char** argv)
     if (!ParseImgSize(glsl, g_imgW, g_imgH)) {
         printf("input.glsl 中未找到 IMG_W/IMG_H 常量\n"); return 1;
     }
-    // 裁剪视口初始 = 全图（右键点击后缩小为 1/4）
-    g_cropX = 0.f; g_cropY = 0.f; g_cropW = g_imgW; g_cropH = g_imgH;
+    // 区域放大镜初始状态：倍数来自 --zoom，中心默认画布中心（--zoom-x/-y 可指定）
+    g_zoom = zoomArg;
+    g_camX = zoomX >= 0.f ? zoomX : g_imgW * 0.5f;
+    g_camY = zoomY >= 0.f ? zoomY : g_imgH * 0.5f;
+    if (g_zoom > 1.f)
+        printf("区域放大镜: zoom %.2fx, 中心 (%.0f, %.0f)（左键拖拽平移，滚轮缩放）\n", g_zoom, g_camX, g_camY);
     // 高清直渲：pass1 渲染目标 = 画布 × scale（splat 坐标在 VS 里乘 uScale 对齐）
     int rW = (int)std::max(1, (int)llroundf(g_imgW * scale));
     int rH = (int)std::max(1, (int)llroundf(g_imgH * scale));
@@ -796,6 +768,9 @@ int main(int argc, char** argv)
     size_t drawN = 0;               // 动画模式：已绘制的 splat 数（按 kData 顺序累积）
     double beatAcc = 0.0;           // 动画节拍累计器（animFps 节拍驱动）
     bool fboInited = false;         // 动画模式：FBO 是否已 clear
+    bool lastBtn = false;           // 区域放大镜：上一帧左键是否按下（拖拽平移用）
+    double lastMX = 0, lastMY = 0;  // 区域放大镜：上一帧鼠标位置
+    glfwGetCursorPos(win, &lastMX, &lastMY);
 
     // 增量绘制 [base, base+cnt) 段。over 算子满足结合律：段内顺序保持，段间在
     // 持久 FBO 上叠加（RGBA32F 全精度）≡ 一次性按序全量渲染。动画每帧只画新增段，
@@ -808,16 +783,24 @@ int main(int argc, char** argv)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glUseProgram(pSplat.id);
         glUniform2f(pSplat.res, (float)rW, (float)rH);
-        glUniform2f(pSplat.sz, 1.f, 1.f);          // 画布像素 -> 画布像素（1:1）
-        glUniform2f(pSplat.off, 0.f, 0.f);
+        // 区域放大镜：只渲染画布上 (g_camX,g_camY) 为中心、1/g_zoom 大小的区域，
+        // 以 scale*zoom 倍密度栅格化——对连续高斯函数的高密度采样，放大不受屏幕尺寸限制。
+        // VS 里 q 已是"画布坐标×scale"（scaled canvas），qToClip 用 (off + q*plate)/res 映射，
+        // 故 plate = zoom（屏幕像素/ scaled 像素），off = -区域左上角×scale×zoom（屏幕像素）。
+        float plate = 1.f, offX = 0.f, offY = 0.f;
+        if (g_zoom > 1.f) {
+            float ox = g_camX - g_imgW * 0.5f / g_zoom;
+            float oy = g_camY - g_imgH * 0.5f / g_zoom;
+            plate = g_zoom;
+            offX = -ox * scale * g_zoom;
+            offY = -oy * scale * g_zoom;
+        }
+        glUniform2f(pSplat.sz, plate, plate);
+        glUniform2f(pSplat.off, offX, offY);
         // 上限按放大坐标系长边（覆盖正常 splat 的 3σ 包围盒；此前硬编码 1080*0.35=378，
         // 在大画布（800x1165）上会截断大 splat 的包围盒导致渲染错位/缺失）
         glUniform1f(pSplat.cap, (float)std::max(rW, rH));
         glUniform1f(uScaleLoc, scale);
-        // 裁剪视口（右键无损放大）：整体平移 -uCropO 再乘 uZoom=imgW/cropW，
-        // 使裁剪区域铺满 FBO（连续函数高密度采样 = 无损放大）
-        glUniform2f(pSplat.cropO, g_cropX, g_cropY);
-        glUniform1f(pSplat.zoom, g_imgW / g_cropW);
         glUniform1i(pSplat.spl, 0);
         glUniform1i(pSplat.texW, kTexW);
         glUniform1i(uBaseLoc, base);
@@ -837,13 +820,6 @@ int main(int argc, char** argv)
         lastT = t;
         fpsAcc += dt; fpsN++;
 
-        // 裁剪视口变化（右键/中键回调置位）：非动画重渲 FBO；动画从零重播（坐标空间已变）
-        if (g_cropDirty) {
-            g_cropDirty = false;
-            if (!animMode) cacheReady = false;
-            else { drawN = 0; fboInited = false; }
-        }
-
         // 动画模式：每节拍增量画 [drawN, drawN+rate) 段到持久 FBO（不重绘、不清屏，
         // 首段前 clear 一次；30fps 节拍 = 每秒 30*animRate，总时长是 60fps 的 2 倍）
         if (animMode && drawN < NS) {
@@ -858,14 +834,44 @@ int main(int argc, char** argv)
             }
         }
 
+        // 区域放大镜交互：左键拖拽平移区域，滚轮缩放（缩放锚点=当前中心，clamp 到画布内）
+        bool camDirty = false;
+        if (g_zoom > 1.f) {
+            double mx, my;
+            glfwGetCursorPos(win, &mx, &my);
+            bool btn = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+            if (btn && lastBtn) {
+                double fit = scale * g_zoom;                     // 屏幕像素 -> 画布像素
+                float halfW = g_imgW * 0.5f / g_zoom, halfH = g_imgH * 0.5f / g_zoom;
+                g_camX = ClampF(g_camX - (float)((mx - lastMX) / fit), halfW, g_imgW - halfW);
+                g_camY = ClampF(g_camY - (float)((my - lastMY) / fit), halfH, g_imgH - halfH);
+                camDirty = true;
+            }
+            lastBtn = btn;
+            lastMX = mx; lastMY = my;
+            if (g_scrollY != 0.0) {
+                // 反向：本机滚轮 y 与常规习惯相反（自然滚动/触控板），取负号使"滚轮=放大"、
+                // "反向滚=缩小"；g_zoom clamp 到 [1,64]
+                g_zoom = ClampF(g_zoom * (float)pow(1.1, -g_scrollY), 1.0f, 64.0f);
+                g_scrollY = 0.0;
+                camDirty = true;
+            }
+            if (camDirty && animMode) {   // 动画模式：镜头变化后重置动画，从头按新镜头增量绘制
+                drawN = 0;
+                fboInited = false;
+            }
+        }
+
         if (fpsAcc >= 0.5) {
-            char title[160];
-            float zoom = g_imgW / g_cropW;   // 裁剪放大倍数（全图=1x）
-            if (animMode)
-                snprintf(title, sizeof(title), "fitsplat_gl  %zd/%zd (%.1f%%)  %.1fx  %.1f fps",
-                         drawN, NS, 100.0 * (double)drawN / (double)NS, zoom, fpsN / fpsAcc);
+            char title[128];
+            if (g_zoom > 1.f)
+                snprintf(title, sizeof(title), "fitsplat_gl  zoom %.2fx (%.0f,%.0f)  %d splats  %.1f fps",
+                         g_zoom, g_camX, g_camY, (int)NS, fpsN / fpsAcc);
+            else if (animMode)
+                snprintf(title, sizeof(title), "fitsplat_gl  %zd/%zd (%.1f%%)  %.1f fps",
+                         drawN, NS, 100.0 * (double)drawN / (double)NS, fpsN / fpsAcc);
             else
-                snprintf(title, sizeof(title), "fitsplat_gl  %d splats  %.1fx  %.1f fps", (int)NS, zoom, fpsN / fpsAcc);
+                snprintf(title, sizeof(title), "fitsplat_gl  %d splats  %.1f fps", (int)NS, fpsN / fpsAcc);
             glfwSetWindowTitle(win, title);
             fpsAcc = 0.0; fpsN = 0;
         }
@@ -880,10 +886,12 @@ int main(int argc, char** argv)
         float szxW = g_imgW * sW, szyW = g_imgH * sW;
         float offXW = (W - szxW) * 0.5f, offYW = (H - szyW) * 0.5f;
 
-        // ---- pass1（非动画：全量一次渲染缓存 FBO，之后每帧仅 pass2 输出）----
-        if (!cacheReady)
+        // ---- pass1（非动画：全量渲染缓存 FBO；区域放大镜镜头变化时重渲，之后每帧仅 pass2 输出）----
+        // 注意：动画模式不走这里（增量段由上方 anim 块绘制），否则首帧全量绘制会破坏渐进浮现。
+        if (!animMode && (!cacheReady || camDirty))
         {
             cacheReady = true;
+            camDirty = false;
             DrawSeg(0, (int)NS, true);
             if (dump) DumpFBO("fbodump.raw", rW, rH);
             if (!exportBase.empty()) {
@@ -902,7 +910,6 @@ int main(int argc, char** argv)
         // uv 分母用画布尺寸（非渲染目标 rW×rH）：letterbox 后 q 是画布坐标（0..W画布），
         // FBO 内容 = 画布坐标×scale，归一化 uv 与画布 0-1 线性对应。若用 rW×rH 只采样纹理一部分。
         glUniform2f(pPresent.imgSz, g_imgW, g_imgH);
-        glUniform4f(pPresent.crop, g_cropX, g_cropY, g_cropW, g_cropH);   // 裁剪区域（右键放大）
         glUniform1i(pPresent.tex, 0);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, tA);

@@ -182,12 +182,13 @@ void main(){ FragColor = vec4(0.0, 0.0, 0.0, 1.0); }
 static const char* kVSSplat = R"(
 uniform sampler2D uSpl;   // NS*3 个 texel 展平为 uTexW 宽的二维纹理
 uniform int    uTexW;     // 展平宽度（<< GL_MAX_TEXTURE_SIZE，避免大 NS 纹理单维超限）
+uniform int    uBase;     // 动画增量模式：实例偏移（默认 0 = 从第 0 个开始）
 uniform float uTime;
 uniform float uCap;   // 包围盒偏移上限（画布短边*0.35，对齐 playpiano 的 ex/ey clamp 防铺满屏幕）
 out vec2 vMu; out vec2 vSC; out vec2 vS; out vec3 vCol; out float vA;
 vec4 fetchParam(int ti){ return texelFetch(uSpl, ivec2(ti % uTexW, ti / uTexW), 0); }
 void main(){
-    int id = gl_InstanceID;
+    int id = gl_InstanceID + uBase;
     vec4 A = fetchParam(id * 3 + 0);   // (mx,my,sx,sy)
     vec4 B = fetchParam(id * 3 + 1);   // (r,g,b,a)
     vec4 C = fetchParam(id * 3 + 2);   // (cos,sin,0,0)
@@ -708,6 +709,7 @@ int main(int argc, char** argv)
     Prog pSplat = MakeProg(kVSSplat, kFSSplat, "splat");
     Prog pPresent = MakeProg(kVSFull, kFSPresent, "present");
     if (!pSplat.id || !pPresent.id) return 1;
+    GLint uBaseLoc = glGetUniformLocation(pSplat.id, "uBase");   // 动画增量：实例偏移
 
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
@@ -716,12 +718,41 @@ int main(int argc, char** argv)
     // 这样窗口 framebuffer 尺寸（受屏幕/边框影响，如 1017/1061）不影响正确性。
     CreateTargets((int)g_imgW, (int)g_imgH);
 
-    // ---- 渲染循环（对齐 playpiano_gl：静态底图 splat 只渲一次缓存，每帧仅一次输出）----
-    bool cacheReady = false;
+    // ---- 渲染循环 ----
+    bool cacheReady = false;        // 非动画：FBO 是否已渲染完成
     double lastT = glfwGetTime();
     double fpsAcc = 0.0; int fpsN = 0;
-    size_t drawN = 0;          // 动画模式：当前已绘制的 splat 数（按 kData 顺序累积）
-    double beatAcc = 0.0;      // 动画节拍累计器（animFps 节拍驱动）
+    size_t drawN = 0;               // 动画模式：已绘制的 splat 数（按 kData 顺序累积）
+    double beatAcc = 0.0;           // 动画节拍累计器（animFps 节拍驱动）
+    bool fboInited = false;         // 动画模式：FBO 是否已 clear
+
+    // 增量绘制 [base, base+cnt) 段。over 算子满足结合律：段内顺序保持，段间在
+    // 持久 FBO 上叠加（RGBA32F 全精度）≡ 一次性按序全量渲染。动画每帧只画新增段，
+    // 渲染开销恒定 O(animRate)，不会随累计量增长（重绘方案是 ΣN ≈ N²/2 的二次方）。
+    auto DrawSeg = [&](int base, int cnt, bool doClear) {
+        glViewport(0, 0, (int)g_imgW, (int)g_imgH);
+        glBindFramebuffer(GL_FRAMEBUFFER, fboA);
+        if (doClear) { glClearColor(0.f, 0.f, 0.f, 0.f); glClear(GL_COLOR_BUFFER_BIT); }
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glUseProgram(pSplat.id);
+        glUniform2f(pSplat.res, g_imgW, g_imgH);
+        glUniform2f(pSplat.sz, 1.f, 1.f);          // 画布像素 -> 画布像素（1:1）
+        glUniform2f(pSplat.off, 0.f, 0.f);
+        // 上限按画布长边（覆盖正常 splat 的 3σ 包围盒；此前硬编码 1080*0.35=378，
+        // 在大画布（800x1165）上会截断大 splat 的包围盒导致渲染错位/缺失）
+        glUniform1f(pSplat.cap, std::fmax(g_imgW, g_imgH));
+        glUniform1i(pSplat.spl, 0);
+        glUniform1i(pSplat.texW, kTexW);
+        glUniform1i(uBaseLoc, base);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, tSpl);
+        glBindVertexArray(vaoQuad);
+        glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, cnt);
+        glDisable(GL_BLEND);
+        GLenum err = glGetError();
+        if (err) printf("splat GL error: 0x%x\n", err);
+    };
 
     while (!glfwWindowShouldClose(win))
     {
@@ -730,15 +761,17 @@ int main(int argc, char** argv)
         lastT = t;
         fpsAcc += dt; fpsN++;
 
-        // 动画模式：按 animFps 节拍推进绘制数量（每节拍新增 animRate 个 splat，按 kData 原始顺序累积；
-        // 30fps 节拍 = 每秒 30*animRate，总时长是 60fps 的 2 倍）
+        // 动画模式：每节拍增量画 [drawN, drawN+rate) 段到持久 FBO（不重绘、不清屏，
+        // 首段前 clear 一次；30fps 节拍 = 每秒 30*animRate，总时长是 60fps 的 2 倍）
         if (animMode && drawN < NS) {
             beatAcc += dt;
             double beat = 1.0 / animFps;
             while (beatAcc >= beat && drawN < NS) {
                 beatAcc -= beat;
-                drawN = std::min(drawN + (size_t)animRate, NS);
-                cacheReady = false;   // 每节拍多画 animRate 个 splat，pass1 需重渲（FBO = 前 drawN 个全部）
+                int cnt = (int)std::min((size_t)animRate, NS - drawN);
+                DrawSeg((int)drawN, cnt, !fboInited);
+                fboInited = true;
+                drawN += (size_t)cnt;
             }
         }
 
@@ -763,33 +796,11 @@ int main(int argc, char** argv)
         float szxW = g_imgW * sW, szyW = g_imgH * sW;
         float offXW = (W - szxW) * 0.5f, offYW = (H - szyW) * 0.5f;
 
-        // ---- pass1（非动画：仅首次 / resize；动画：每帧重渲前 drawN 个实例，按 kData 顺序累积）----
+        // ---- pass1（非动画：全量一次渲染缓存 FBO，之后每帧仅 pass2 输出）----
         if (!cacheReady)
         {
             cacheReady = true;
-            glViewport(0, 0, (int)g_imgW, (int)g_imgH);
-            glBindFramebuffer(GL_FRAMEBUFFER, fboA);
-            glClearColor(0.f, 0.f, 0.f, 0.f);
-            glClear(GL_COLOR_BUFFER_BIT);
-
-            glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            glUseProgram(pSplat.id);
-            glUniform2f(pSplat.res, g_imgW, g_imgH);
-            glUniform2f(pSplat.sz, 1.f, 1.f);          // 画布像素 -> 画布像素（1:1）
-            glUniform2f(pSplat.off, 0.f, 0.f);
-            // 上限按画布长边（覆盖正常 splat 的 3σ 包围盒；此前硬编码 1080*0.35=378，
-            // 在大画布（800x1165）上会截断大 splat 的包围盒导致渲染错位/缺失）
-            glUniform1f(pSplat.cap, std::fmax(g_imgW, g_imgH));
-            glUniform1i(pSplat.spl, 0);
-            glUniform1i(pSplat.texW, kTexW);
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, tSpl);
-            glBindVertexArray(vaoQuad);
-            glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, (GLsizei)(animMode ? std::min(drawN, NS) : NS));
-            glDisable(GL_BLEND);
-            GLenum err = glGetError();
-            if (err) printf("pass1 GL error: 0x%x\n", err);
+            DrawSeg(0, (int)NS, true);
             if (dump) DumpFBO("fbodump.raw", (int)g_imgW, (int)g_imgH);
             if (!exportBase.empty()) {
                 ExportAll(exportBase.c_str(), (int)g_imgW, (int)g_imgH);   // 离线导出：读回 float32 -> PNG16/BMP24

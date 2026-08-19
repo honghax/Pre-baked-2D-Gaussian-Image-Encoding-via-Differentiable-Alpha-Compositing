@@ -105,8 +105,19 @@ fitsplat_gl.exe input.glsl --export out   # headless: write out.png (16-bit) + o
 |---|---|
 | `<file.glsl>` / `--input FILE` | GLSL to render (default: `input.glsl` next to the exe) |
 | `--export BASE` | render one frame headlessly, save `BASE.png` (16-bit) + `BASE.bmp`, then exit |
+| `--anim` | drawing animation: splats are revealed progressively in `kData` order (chaotic emergence effect) |
+| `--anim-rate N` | animation: number of splats added per frame/beat (default 10000) |
+| `--anim-fps 30\|60` | animation beat rate (default 60; 30 → half the speed, twice the total duration) |
 | `--dump` | debug: dump the FBO to `fbodump.raw` |
 | `--dumpwin` | debug: dump the window frame to `windump.raw` |
+
+Drawing animation example — 1M splats emerge at 100k splats per beat, 60 FPS (≈10 s total):
+
+```powershell
+fitsplat_gl.exe input.glsl --anim --anim-rate 100000 --anim-fps 60
+```
+
+The animation renders the first *N* splats each beat (N = beat count × rate) into the cached FBO, so previously drawn splats are naturally retained — no accumulation buffer needed. When the file carries a residual layer, residuals are blended in only after all splats are drawn.
 
 The renderer acts as a **decoder**: it parses the embedded `uint` arrays from the GLSL on the CPU (~74 ms for 1M splats), uploads them as parameter textures, and runs a small shader for per-splat instanced quads — avoiding GPU driver compilation of a multi-hundred-MB constant array.
 

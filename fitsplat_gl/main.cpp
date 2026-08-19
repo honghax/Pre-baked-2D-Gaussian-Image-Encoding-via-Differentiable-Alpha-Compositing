@@ -525,13 +525,21 @@ int main(int argc, char** argv)
     setvbuf(stdout, nullptr, _IONBF, 0);
     bool dump = false, dumpwin = false;
     std::string exportBase, inputPath;   // inputPath: 显式指定 GLSL 文件（--input <file> 或位置参数）
+    int animMode = 0;      // --anim：动画模式，按 kData 数组顺序渐进绘制（混沌浮现效果）
+    int animRate = 10000;  // --anim-rate N：动画每秒新增 splat 数（默认 10000）
+    int animFps = 60;      // --anim-fps 30|60：动画节奏（默认 60；30 时每帧推进量翻倍，总时长一致）
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--dump") == 0) dump = true;
         else if (strcmp(argv[i], "--dumpwin") == 0) dumpwin = true;
         else if (strcmp(argv[i], "--input") == 0 && i + 1 < argc) inputPath = argv[++i];   // 显式指定 GLSL 文件
         else if (strcmp(argv[i], "--export") == 0 && i + 1 < argc) exportBase = argv[++i]; // 离线导出：base.png(16bit)+base.bmp
+        else if (strcmp(argv[i], "--anim") == 0) animMode = 1;                             // 启动动画模式
+        else if (strcmp(argv[i], "--anim-rate") == 0 && i + 1 < argc) animRate = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--anim-fps") == 0 && i + 1 < argc) animFps = atoi(argv[++i]);
         else if (argv[i][0] != '-') inputPath = argv[i];   // 位置参数：直接给 GLSL 文件路径
     }
+    if (animFps != 30 && animFps != 60) animFps = 60;   // 只允许 30/60，非法值回落 60
+    if (animRate <= 0) animRate = 10000;
     if (!glfwInit()) { printf("glfwInit 失败\n"); return 1; }
 
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -712,6 +720,8 @@ int main(int argc, char** argv)
     bool cacheReady = false;
     double lastT = glfwGetTime();
     double fpsAcc = 0.0; int fpsN = 0;
+    size_t drawN = 0;          // 动画模式：当前已绘制的 splat 数（按 kData 顺序累积）
+    double beatAcc = 0.0;      // 动画节拍累计器（animFps 节拍驱动）
 
     while (!glfwWindowShouldClose(win))
     {
@@ -719,9 +729,26 @@ int main(int argc, char** argv)
         double dt = t - lastT;
         lastT = t;
         fpsAcc += dt; fpsN++;
+
+        // 动画模式：按 animFps 节拍推进绘制数量（每节拍新增 animRate 个 splat，按 kData 原始顺序累积；
+        // 30fps 节拍 = 每秒 30*animRate，总时长是 60fps 的 2 倍）
+        if (animMode && drawN < NS) {
+            beatAcc += dt;
+            double beat = 1.0 / animFps;
+            while (beatAcc >= beat && drawN < NS) {
+                beatAcc -= beat;
+                drawN = std::min(drawN + (size_t)animRate, NS);
+                cacheReady = false;   // 每节拍多画 animRate 个 splat，pass1 需重渲（FBO = 前 drawN 个全部）
+            }
+        }
+
         if (fpsAcc >= 0.5) {
             char title[128];
-            snprintf(title, sizeof(title), "fitsplat_gl  %d splats  %.1f fps", (int)NS, fpsN / fpsAcc);
+            if (animMode)
+                snprintf(title, sizeof(title), "fitsplat_gl  %zd/%zd (%.1f%%)  %.1f fps",
+                         drawN, NS, 100.0 * (double)drawN / (double)NS, fpsN / fpsAcc);
+            else
+                snprintf(title, sizeof(title), "fitsplat_gl  %d splats  %.1f fps", (int)NS, fpsN / fpsAcc);
             glfwSetWindowTitle(win, title);
             fpsAcc = 0.0; fpsN = 0;
         }
@@ -736,7 +763,7 @@ int main(int argc, char** argv)
         float szxW = g_imgW * sW, szyW = g_imgH * sW;
         float offXW = (W - szxW) * 0.5f, offYW = (H - szyW) * 0.5f;
 
-        // ---- pass1（仅首次 / resize）：splat 合成到缓存 FBO（画布坐标 1:1，顺序=实例顺序）----
+        // ---- pass1（非动画：仅首次 / resize；动画：每帧重渲前 drawN 个实例，按 kData 顺序累积）----
         if (!cacheReady)
         {
             cacheReady = true;
@@ -759,7 +786,7 @@ int main(int argc, char** argv)
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, tSpl);
             glBindVertexArray(vaoQuad);
-            glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, (GLsizei)NS);
+            glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, (GLsizei)(animMode ? std::min(drawN, NS) : NS));
             glDisable(GL_BLEND);
             GLenum err = glGetError();
             if (err) printf("pass1 GL error: 0x%x\n", err);
@@ -783,13 +810,15 @@ int main(int argc, char** argv)
         glBindTexture(GL_TEXTURE_2D, tA);
         GLint uResLoc = glGetUniformLocation(pPresent.id, "uResTex");
         GLint uHasLoc = glGetUniformLocation(pPresent.id, "uHasRes");
-        if (resTex) {
+        // 动画模式：绘制完成前不叠残差（保留"混沌浮现"过程），画完后才叠加锐化细节
+        bool resActive = resTex && (!animMode || drawN >= NS);
+        if (resActive) {
             glUniform1i(uResLoc, 1);
             glUniform1i(uHasLoc, 1);
             glActiveTexture(GL_TEXTURE1);
             glBindTexture(GL_TEXTURE_2D, resTex);
         } else {
-            glUniform1i(uHasLoc, 0);   // 无残差层：shader 跳过叠加
+            glUniform1i(uHasLoc, 0);   // 无残差层或动画未完成：shader 跳过叠加
         }
         glBindVertexArray(vaoTri);
         glDrawArrays(GL_TRIANGLES, 0, 3);

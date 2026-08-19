@@ -833,7 +833,9 @@ int main(int argc, char** argv)
         glUniform2f(pPresent.res, (float)W, (float)H);
         glUniform2f(pPresent.sz, sW, sW);
         glUniform2f(pPresent.off, offXW, offYW);
-        glUniform2f(pPresent.imgSz, (float)rW, (float)rH);   // 采样目标 = pass1 渲染目标尺寸（画布×scale）
+        // uv 分母用画布尺寸（非渲染目标 rW×rH）：letterbox 后 q 是画布坐标（0..W画布），
+        // FBO 内容 = 画布坐标×scale，归一化 uv 与画布 0-1 线性对应。若用 rW×rH 只采样纹理一部分。
+        glUniform2f(pPresent.imgSz, g_imgW, g_imgH);
         glUniform1i(pPresent.tex, 0);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, tA);

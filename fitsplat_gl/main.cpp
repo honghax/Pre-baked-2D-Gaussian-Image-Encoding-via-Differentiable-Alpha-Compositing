@@ -26,6 +26,7 @@
 #include <vector>
 #include <cstring>
 #include <chrono>
+#include <filesystem>   // 扫描同目录 *_splatA/B/C.raw（GLSL 改名后 raw 未跟随时自动匹配）
 
 static long long NowMs()
 {
@@ -665,6 +666,25 @@ int main(int argc, char** argv)
     if (!haveRaw) {
         rawA.clear(); rawB.clear(); rawC.clear();
         haveRaw = loadRaw(baseDir + "/input", rawA, rawB, rawC);   // 旧版 input_ 前缀兼容
+    }
+    if (!haveRaw) {
+        // GLSL 改名后 raw 未跟随改名：扫描同目录所有 *_splatA/B/C.raw 三件套自动匹配
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        for (auto& ent : fs::directory_iterator(baseDir.empty() ? "." : baseDir, ec)) {
+            if (ec) break;
+            std::string nm = ent.path().filename().string();
+            size_t pos = nm.rfind("_splatA.raw");
+            if (pos == std::string::npos || pos == 0) continue;
+            std::string pre = nm.substr(0, pos);
+            if (pre.empty()) continue;
+            rawA.clear(); rawB.clear(); rawC.clear();
+            if (loadRaw(baseDir + "/" + pre, rawA, rawB, rawC)) {
+                baseName = pre;
+                haveRaw = true;
+                break;
+            }
+        }
     }
     if (haveRaw) {
         printf("参数来源: %s_splatA/B/C.raw\n", baseName.c_str());

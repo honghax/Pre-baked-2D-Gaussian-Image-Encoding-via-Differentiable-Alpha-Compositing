@@ -83,6 +83,13 @@ fitsplat input.png --splats 350000 --iters 15000 --width 800 --embed 1 --out out
 | `--model N` | 1 | render model: `1` = additive (order-independent, default), `0` = alpha compositing (classic 3DGS) |
 | `--l1only N` | 0 | `1` = use L1 loss only (default is L1 + SSIM) |
 | `--l2 N` | 0 | `1` = use L2 loss |
+| `--target F` | 0 | target PSNR (dB); full-canvas eval every 10% of iterations, training stops early once reached (0 = disabled) |
+| `--gputrain 1` | 0 | run training on GPU compute shaders (forward/backward/Adam all on GPU, density control on CPU; requires OpenGL 4.3; default CPU) |
+| `--gpu 1` | 0 | after training, run a GPU forward tile-render benchmark (OpenGL 4.3 compute) |
+| `--init 1` | 0 | gradient-guided initialization (content-adaptive: sample by image gradient, concentrate splats on detail regions; default 0 = grid) |
+| `--prog 1` | 0 | error-guided progressive optimization (start with 50% of splats, add residual splats to under-fit regions up to the `--splats` budget) |
+| `--init-scale F` | 5.0 | initial/added Gaussian scale in pixels (applies with `--init 1` / `--prog 1`) |
+| `--dump-target 1` | 0 | debug: dump target pixels (float) to `target.raw` |
 | `--ckpt FILE` | — | save a checkpoint every `--ckpt-every` iterations |
 | `--ckpt-every N` | 2000 | checkpoint interval |
 | `--resume FILE` | — | resume training from a checkpoint |
@@ -113,6 +120,10 @@ fitsplat_gl.exe input.glsl --export out   # headless: write out.png (16-bit) + o
 | `--anim` | drawing animation: splats are revealed progressively in `kData` order (chaotic emergence effect) |
 | `--anim-rate N` | animation: number of splats added per frame/beat (default 10000) |
 | `--anim-fps 30\|60` | animation beat rate (default 60; 30 → half the speed, twice the total duration) |
+| `--scale N` | high-res direct rendering: pass1 target = canvas × N, splat coords scaled by N (default 1; true high-density rasterization, not texture upscale) |
+| `--zoom N` | region magnifier: `N` = render only a 1/N region of the canvas at N× density (default 1 = off; any multiplier, not limited by screen) |
+| `--zoom-x CX` | magnifier region center X in canvas pixels (default: canvas center) |
+| `--zoom-y CY` | magnifier region center Y in canvas pixels (default: canvas center) |
 | `--dump` | debug: dump the FBO to `fbodump.raw` |
 | `--dumpwin` | debug: dump the window frame to `windump.raw` |
 

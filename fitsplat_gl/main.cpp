@@ -650,8 +650,13 @@ int main(int argc, char** argv)
     // 无纹理纯 GLSL（--embed）的 kSA/kSB/kSC const 数组解析 —— 单文件即可渲染。
     // raw 命名：fitsplat 训练时按输出 GLSL 同基名生成（如 out_xxx_splatA.raw），
     // 因此先按 GLSL 基名匹配；旧版固定 input_ 前缀，作为回退。
-    std::string baseDir = glslPath.substr(0, glslPath.find_last_of("\\/"));
-    std::string baseName = glslPath.substr(glslPath.find_last_of("\\/") + 1);
+    std::string baseDir = ".";
+    std::string baseName = glslPath;
+    size_t sep = glslPath.find_last_of("\\/");
+    if (sep != std::string::npos) {
+        baseDir = glslPath.substr(0, sep);      // 含路径时取目录
+        baseName = glslPath.substr(sep + 1);    // 取文件名
+    }
     size_t dotB = baseName.find_last_of('.');
     if (dotB != std::string::npos) baseName = baseName.substr(0, dotB);
     std::vector<unsigned char> rawA, rawB, rawC;

@@ -559,6 +559,9 @@ static void ExportAll(const char* base, int w, int h)
 
 int main(int argc, char** argv)
 {
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);   // 中文日志按 UTF-8 输出，避免 GBK(936) 终端乱码
+#endif
     setvbuf(stdout, nullptr, _IONBF, 0);
     bool dump = false, dumpwin = false;
     std::string exportBase, inputPath;   // inputPath: 显式指定 GLSL 文件（--input <file> 或位置参数）
@@ -644,14 +647,27 @@ int main(int argc, char** argv)
     // ---- 加载 splat 参数 ----
     // 优先读 *_splatA/B/C.raw（RGBA32F，每行一个 splat）；若缺失则从
     // 无纹理纯 GLSL（--embed）的 kSA/kSB/kSC const 数组解析 —— 单文件即可渲染。
+    // raw 命名：fitsplat 训练时按输出 GLSL 同基名生成（如 out_xxx_splatA.raw），
+    // 因此先按 GLSL 基名匹配；旧版固定 input_ 前缀，作为回退。
     std::string baseDir = glslPath.substr(0, glslPath.find_last_of("\\/"));
+    std::string baseName = glslPath.substr(glslPath.find_last_of("\\/") + 1);
+    size_t dotB = baseName.find_last_of('.');
+    if (dotB != std::string::npos) baseName = baseName.substr(0, dotB);
     std::vector<unsigned char> rawA, rawB, rawC;
     std::vector<float> vA, vB, vC;
-    bool haveRaw = ReadFileBin(baseDir + "/input_splatA.raw", rawA) &&
-                   ReadFileBin(baseDir + "/input_splatB.raw", rawB) &&
-                   ReadFileBin(baseDir + "/input_splatC.raw", rawC);
+    auto loadRaw = [&](const std::string& prefix, std::vector<unsigned char>& a,
+                       std::vector<unsigned char>& b, std::vector<unsigned char>& c) {
+        return ReadFileBin(prefix + "_splatA.raw", a) &&
+               ReadFileBin(prefix + "_splatB.raw", b) &&
+               ReadFileBin(prefix + "_splatC.raw", c);
+    };
+    bool haveRaw = loadRaw(baseDir + "/" + baseName, rawA, rawB, rawC);
+    if (!haveRaw) {
+        rawA.clear(); rawB.clear(); rawC.clear();
+        haveRaw = loadRaw(baseDir + "/input", rawA, rawB, rawC);   // 旧版 input_ 前缀兼容
+    }
     if (haveRaw) {
-        printf("参数来源: *_splatA/B/C.raw\n");
+        printf("参数来源: %s_splatA/B/C.raw\n", baseName.c_str());
     } else if (ParseVec4Array(glsl, "kSA", vA) && ParseVec4Array(glsl, "kSB", vB) &&
                ParseVec4Array(glsl, "kSC", vC)) {
         printf("参数来源: input.glsl 内嵌 kSA/kSB/kSC const 数组（无纹理模式）\n");
@@ -662,7 +678,11 @@ int main(int argc, char** argv)
         // 新版 --embed：uint 打包压缩（每 splat 4 个 uint），CPU 解码器还原参数
         std::vector<unsigned> uData;
         if (!ParseUintArray(glsl, "kData", uData) || uData.size() < 4 || uData.size() % 4 != 0) {
-            printf("未找到 *_splatA/B/C.raw，也无法解析 kSA/kSB/kSC/kData 数组\n"); return 1;
+            printf("未找到 %s_splatA/B/C.raw，也无法解析 GLSL 内嵌 kSA/kSB/kSC/kData 数组\n", baseName.c_str());
+            printf("  可能原因：该 GLSL 是不含内嵌参数的纹理模式产物（训练时未加 --embed 1）。\n");
+            printf("  解决方法：1) 训练加 --embed 1（参数内嵌进 GLSL，单文件即可渲染）；\n");
+            printf("             2) 把 fitsplat 生成的 *_splatA/B/C.raw 复制到本 GLSL 同目录。\n");
+            return 1;
         }
         size_t ns = uData.size() / 4;
         printf("参数来源: input.glsl 内嵌 kData uint 打包数组（CPU 解码 %d splat）\n", (int)ns);

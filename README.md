@@ -139,6 +139,8 @@ The renderer acts as a **decoder**: it parses the embedded `uint` arrays from th
 
 It also parses the `MODEL=` tag from the GLSL header and renders accordingly: `additive` → splats uploaded in training order with `GL_ONE / GL_ONE` accumulation (order-independent); `alpha` → splats reversed and blended with `GL_SRC_ALPHA / GL_ONE_MINUS_SRC_ALPHA`. Files without the tag (pre-dual-mode exports) fall back to alpha compositing.
 
+For texture-mode exports (non-`--embed`), the trainer writes `*_splatA/B/C.raw` named after the output GLSL (e.g. `out.glsl` → `out_splatA.raw`); the renderer matches them by the GLSL's base name (falling back to the legacy `input_` prefix). `--embed 1` products carry all parameters inside the GLSL itself and need no extra files.
+
 ## Results
 
 800×1165 canvas, 1,017,194 splats, 15k iterations (quantized embedded export).

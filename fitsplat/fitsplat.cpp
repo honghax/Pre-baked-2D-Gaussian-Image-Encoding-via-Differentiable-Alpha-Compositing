@@ -1343,6 +1343,7 @@ static void GpuTrainLoop(int startIt, int iters, int nTile, size_t maxK, int pre
 
 int main(int argc, char** argv) {
 #ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);   // 中文日志按 UTF-8 输出，避免 GBK(936) 终端乱码
     // 正常优先级：用户要求 CPU 压榨（此前 BELOW_NORMAL 导致调度份额低、CPU 利用率只有 ~20%）
     SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
 #endif

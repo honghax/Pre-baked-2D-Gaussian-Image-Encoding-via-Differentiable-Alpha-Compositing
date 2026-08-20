@@ -37,6 +37,12 @@
 #include <windows.h>
 #endif
 
+// GPU 前向渲染基准（--gpu）：OpenGL 4.3 compute shader（glad43 为训练器专用 loader，
+// 与播放器 fitsplat_gl 的 3.3 glad 各自链接，互不冲突）
+#include <glad/glad.h>
+#define GLFW_INCLUDE_NONE   // 阻止 glfw3.h 引入系统 gl.h 与 glad 冲突
+#include <GLFW/glfw3.h>
+
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
@@ -384,11 +390,751 @@ static void PrintUsage() {
     printf("  --embed 1     输出无纹理纯 GLSL（参数内嵌 const 数组）\n");
     printf("  --l1only 1    纯 L1 损失（对照实验，默认 0 = 0.8L1+0.2SSIM）\n");
     printf("  --l2 1        像素梯度用 L2(∝误差) 替代 L1 次梯度(±1)，高精度收敛更干净（默认 0）\n");
+    printf("  --target F    目标 PSNR(dB)，每 10%% 迭代全图评估，达到即提前停止（默认 0 = 不启用）\n");
+    printf("  --gputrain 1  训练切到 GPU compute shader（正传/反传/Adam 全 GPU，需 OpenGL 4.3；默认 0 = CPU）\n");
 }
 
 static double NowSec() {
     using namespace std::chrono;
     return duration<double>(steady_clock::now().time_since_epoch()).count();
+}
+
+// ---------- GPU 前向 tile 渲染基准（--gpu）----------
+// 验证思路（只移植最容易验证的前向）：
+//   CPU：BuildTileMap 构建 tile → splat 索引表
+//   GPU：每个 workgroup 渲染一个 16x16 tile，逐像素按列表顺序 alpha 合成
+//   CPU：读回结果，与 CPU Evaluate 全量渲染对比（数值一致性 + 耗时加速比）
+static const char* kGpuFwdShader = R"GLSL(
+#version 430 core
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// 每 splat 3xvec4：(mx,my,sx,sy) (cs,sn,r,g) (b,a,0,0)
+layout(std430, binding = 0) readonly buffer SSplats { vec4 splat[]; };
+layout(std430, binding = 1) readonly buffer SOff   { uint off[]; };
+layout(std430, binding = 2) readonly buffer SCnt   { uint cnt[]; };
+layout(std430, binding = 3) readonly buffer SIdx   { uint idx[]; };
+layout(std430, binding = 4) writeonly buffer SImg  { vec4 img[]; };
+
+uniform uint uTCOLS;
+uniform uint uImgW;
+uniform uint uImgH;
+
+void main() {
+    uvec2 px = gl_GlobalInvocationID.xy;
+    uint tile = uTCOLS * gl_WorkGroupID.y + gl_WorkGroupID.x;
+    uint n    = cnt[tile];
+    uint base = off[tile];
+    vec2 p = vec2(float(px.x) + 0.5f, float(px.y) + 0.5f);
+    vec3 acc = vec3(0.0f);
+    float T = 1.0f;
+    for (uint k = 0u; k < n; ++k) {
+        uint gi = idx[base + k];
+        vec4 sa = splat[gi * 3u + 0u];
+        vec4 sb = splat[gi * 3u + 1u];
+        vec4 sc = splat[gi * 3u + 2u];
+        float dx = p.x - sa.x;
+        float dy = p.y - sa.y;
+        float m = max(sa.z, sa.w);
+        if (dx * dx + dy * dy > 9.0f * m * m) continue;   // 3σ 快速剔除（与 CPU RenderPixel 一致）
+        float ex = (sb.x * dx + sb.y * dy) / sa.z;
+        float ey = (-sb.y * dx + sb.x * dy) / sa.w;
+        float gv = exp(-0.5f * (ex * ex + ey * ey));
+        float alpha = sc.y * gv;
+        acc += vec3(sb.z, sb.w, sc.x) * (alpha * T);
+        T *= 1.0f - alpha;
+    }
+    if (px.x < uImgW && px.y < uImgH)
+        img[px.y * uImgW + px.x] = vec4(clamp(acc, 0.0f, 1.0f), 1.0f);
+}
+)GLSL";
+
+static double GpuForwardTest()
+{
+    // 1) CPU 构建 16x16 tile（与 Evaluate 完全一致），单独计时
+    double t0b = NowSec();
+    TileMap tm;
+    BuildTileMap(splats, 16, tm);
+    double buildTime = NowSec() - t0b;
+    int TCOLS = tm.TCOLS, TROWS = tm.TROWS;
+    int NS = (int)splats.size();
+    printf("[gpu] CPU BuildTileMap(16x16) %g ms, %d 个 tile, 每 tile 平均 %.1f splat\n",
+           buildTime * 1e3, TCOLS * TROWS, (double)tm.idx.size() / (TCOLS * TROWS));
+
+    // 2) 隐藏窗口 4.3 core 上下文
+    if (!glfwInit()) { printf("[gpu] glfwInit 失败\n"); return -1; }
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    GLFWwindow* win = glfwCreateWindow(16, 16, "fitsplat-gpu", nullptr, nullptr);
+    if (!win) {
+        printf("[gpu] 创建 4.3 core 上下文失败（驱动/核显不支持 compute shader）\n");
+        glfwTerminate(); return -1;
+    }
+    glfwMakeContextCurrent(win);
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+        printf("[gpu] gladLoadGL 失败\n"); glfwTerminate(); return -1;
+    }
+    printf("[gpu] 上下文: OpenGL %s, GLSL %s, 渲染器 %s\n",
+           glGetString(GL_VERSION), glGetString(GL_SHADING_LANGUAGE_VERSION), glGetString(GL_RENDERER));
+
+    // 3) 编译链接 compute shader
+    GLuint cs = glCreateShader(GL_COMPUTE_SHADER);
+    glShaderSource(cs, 1, &kGpuFwdShader, nullptr);
+    glCompileShader(cs);
+    GLint ok = 0;
+    glGetShaderiv(cs, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[8192]; glGetShaderInfoLog(cs, 8192, nullptr, log);
+        printf("[gpu] compute 编译失败:\n%s\n", log);
+        glDeleteShader(cs); glfwTerminate(); return -1;
+    }
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, cs); glLinkProgram(prog);
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[8192]; glGetProgramInfoLog(prog, 8192, nullptr, log);
+        printf("[gpu] compute 链接失败:\n%s\n", log);
+        glDeleteShader(cs); glDeleteProgram(prog); glfwTerminate(); return -1;
+    }
+    glDeleteShader(cs);
+
+    // 4) splat 参数打包：每 splat 12 float = 3x vec4
+    std::vector<float> sp((size_t)NS * 12);
+    for (int i = 0; i < NS; ++i) {
+        const Splat& s = splats[i];
+        float* d = &sp[(size_t)i * 12];
+        d[0]=s.mx; d[1]=s.my; d[2]=s.sx; d[3]=s.sy;
+        d[4]=s.cs; d[5]=s.sn; d[6]=s.r;  d[7]=s.g;
+        d[8]=s.b;  d[9]=s.a;  d[10]=0;   d[11]=0;
+    }
+
+    // 5) SSBO 上传
+    GLuint sbo[5]; glGenBuffers(5, sbo);
+    auto upload = [&](int idx, size_t bytes, const void* data) {
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, sbo[idx]);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)bytes, data, GL_STATIC_DRAW);
+    };
+    double t0u = NowSec();
+    upload(0, sp.size() * 4, sp.data());
+    upload(1, (size_t)TCOLS * TROWS * 4, tm.off.data());
+    upload(2, (size_t)TCOLS * TROWS * 4, tm.cnt.data());
+    upload(3, tm.idx.size() * 4, tm.idx.data());
+    upload(4, (size_t)W * H * 16, nullptr);
+    double upTime = NowSec() - t0u;
+    printf("[gpu] SSBO 上传 %.1f MB %g ms\n",
+           (double)(sp.size() * 4 + tm.idx.size() * 4 + (size_t)TCOLS * TROWS * 8 + (size_t)W * H * 16) / 1e6, upTime * 1e3);
+
+    glUseProgram(prog);
+    for (int i = 0; i < 5; ++i) glBindBufferBase(GL_SHADER_STORAGE_BUFFER, i, sbo[i]);
+    glUniform1ui(glGetUniformLocation(prog, "uTCOLS"), (GLuint)TCOLS);
+    glUniform1ui(glGetUniformLocation(prog, "uImgW"),  (GLuint)W);
+    glUniform1ui(glGetUniformLocation(prog, "uImgH"),  (GLuint)H);
+
+    // 6) dispatch 计时（5 次取最小，排除首帧驱动编译）
+    double gpuBest = 1e18;
+    for (int rep = 0; rep < 5; ++rep) {
+        double t0 = NowSec();
+        glDispatchCompute((GLuint)TCOLS, (GLuint)TROWS, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+        glFinish();
+        double t1 = NowSec();
+        gpuBest = std::min(gpuBest, t1 - t0);
+    }
+    printf("[gpu] dispatch %dx%d workgroup（%d 个 16x16 tile）, 最佳 %g ms\n",
+           TCOLS, TROWS, TCOLS * TROWS, gpuBest * 1e3);
+
+    // 7) 读回
+    std::vector<float> img((size_t)W * H * 4);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, sbo[4]);
+    void* mp = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(img.size() * 4), GL_MAP_READ_BIT);
+    if (mp) memcpy(img.data(), mp, img.size() * 4);
+    glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+
+    // 8) CPU Evaluate 参考（计时，含内部 BuildTileMap）
+    double t0c = NowSec();
+    std::vector<float> refRGB;
+    double mseCpu = Evaluate(&refRGB);
+    double cpuTime = NowSec() - t0c;
+
+    // 9) GPU vs CPU 参考一致性 + GPU vs 原图 PSNR
+    double mseDiff = 0, mseTgt = 0; long long nv = 0;
+    for (int j = 0; j < H; ++j)
+        for (int i = 0; i < W; ++i) {
+            size_t p = (size_t)j * W + i;
+            if (!valid[p]) continue;
+            const float* g = &img[p * 4];
+            const float* c = &refRGB[p * 3];
+            float dr = g[0]-c[0], dg = g[1]-c[1], db = g[2]-c[2];
+            mseDiff += (double)(dr*dr + dg*dg + db*db);
+            mseTgt  += (double)((g[0]-target[p*3])*(g[0]-target[p*3]) +
+                                (g[1]-target[p*3+1])*(g[1]-target[p*3+1]) +
+                                (g[2]-target[p*3+2])*(g[2]-target[p*3+2]));
+            ++nv;
+        }
+    mseDiff /= (nv * 3.0); mseTgt /= (nv * 3.0);   // 每通道 MSE（与 Evaluate 口径一致，PSNR 可直比）
+    double dbConsist = 10.0 * log10(1.0 / std::max(mseDiff, 1e-12));
+    printf("[gpu] GPU vs CPU 参考差 MSE=%.6g → 一致性 %.2f dB（越高越一致）\n", mseDiff, dbConsist);
+    printf("[gpu] GPU vs 原图 PSNR=%.2f dB（CPU Evaluate=%.2f dB）\n",
+           10.0 * log10(1.0 / std::max(mseTgt, 1e-12)), 10.0 * log10(1.0 / std::max(mseCpu, 1e-12)));
+    printf("[gpu] CPU 全量渲染 %g ms vs GPU dispatch %g ms → 纯渲染加速 %.2fx\n",
+           cpuTime * 1e3, gpuBest * 1e3, cpuTime / std::max(gpuBest, 1e-12));
+    printf("[gpu] GPU 全流程（上传+dispatch+读回）%g ms\n", (upTime + gpuBest) * 1e3);
+
+    glDeleteProgram(prog); glDeleteBuffers(5, sbo);
+    glfwTerminate();
+    return gpuBest;
+}
+
+// ================= GPU 训练（--gputrain）=================
+// 架构：每 workgroup = 1 个 8x8 训练 tile（local 8x8，每线程 1 像素），四个 compute pass：
+//   zero  清零 stat/touchMark/touchCnt（每迭代开头）
+//   fwd   正传：alpha 合成，fwd 数据(alpha,T,ex,ey)写 SSBO，像素颜色写 pcol，原子累加 loss/像素数
+//   bwd   反传：读 fwd/pcol，反向 alpha 合成 backward 递推，原子加 9 参数梯度，稀疏 touch 收集
+//   adam  稀疏 Adam：只更新本迭代 touch 的 splat（读回 touchCnt 后 dispatch），梯度除 nv，清 grad，累积 gradAcc
+// 每迭代仅上传 nTile*2 个 tile 坐标（KB 级）+ 读回 3 个 uint（loss/nv/touchCnt），无大传输；
+// 密度控制每 100 迭代读回全量参数跑 CPU Densify 后重传（~70MB/100 迭代，摊薄后可忽略）。
+static const char* kGpuTrainZero = R"GLSL(
+#version 430 core
+layout(local_size_x=256) in;
+layout(std430,binding=11) buffer BStat { uint stat[]; };   // [loss*1e5, l2*1e5, nv, touchCnt]
+layout(std430,binding=12) buffer BMark { uint mark[]; };   // touchMark[NS]
+uniform uint uN;
+void main(){
+  uint i = gl_GlobalInvocationID.x;
+  if (i < uN) mark[i] = 0u;
+  if (i == 0u) { stat[0] = 0u; stat[1] = 0u; stat[2] = 0u; stat[3] = 0u; }
+}
+)GLSL";
+
+// 正传：每个 workgroup 处理一个 8x8 tile，64 线程 = 64 像素（共享同一 splat 索引列表）
+static const char* kGpuTrainFwd = R"GLSL(
+#version 430 core
+layout(local_size_x=8, local_size_y=8) in;
+layout(std430,binding=0) buffer BP { float p[]; };         // NS*9 参数
+layout(std430,binding=1) buffer BT { float tgt[]; };       // W*H*3 目标
+layout(std430,binding=2) buffer BV { uint valid[]; };      // W*H mask
+layout(std430,binding=3) buffer BOff { uint off[]; };
+layout(std430,binding=4) buffer BCnt { uint cnt[]; };
+layout(std430,binding=5) buffer BIdx { uint idx[]; };
+layout(std430,binding=6) buffer BTxy { uint txy[]; };      // nTile*2 tile 坐标
+layout(std430,binding=7) buffer BFwd { float fwd[]; };     // seq*(uMaxPl*4): (alpha,T,ex,ey)
+layout(std430,binding=8) buffer BPc  { float pcol[]; };    // seq*3: 像素颜色
+layout(std430,binding=11) buffer BStat { uint stat[]; };
+uniform uint uImgW, uImgH, uTCOLS, uMaxPl;
+float SigmoidF(float x){ return 1.0f/(1.0f+exp(-x)); }
+void main(){
+  uint wg = gl_WorkGroupID.x;
+  uint t  = gl_LocalInvocationIndex;
+  uint tx = txy[wg*2u], ty = txy[wg*2u+1u];
+  uint tile = ty*uTCOLS + tx;
+  uint n = cnt[tile], base = off[tile];
+  uint px = tx*8u + t%8u, py = ty*8u + t/8u;
+  uint gid = py*uImgW + px;
+  uint seq = wg*64u + t;
+  if (px >= uImgW || py >= uImgH) return;
+  float cx = float(px)+0.5f, cy = float(py)+0.5f;
+  float T = 1.0f; vec3 acc = vec3(0.0f);
+  uint fbase = seq*uMaxPl*4u;
+  for (uint k=0u;k<n;++k){
+    uint gi = idx[base+k];
+    uint g9 = gi*9u;
+    float mx=p[g9], my=p[g9+1u];
+    float sx=exp(p[g9+2u]), sy=exp(p[g9+3u]);
+    float cs=cos(p[g9+4u]), sn=sin(p[g9+4u]);
+    float r=clamp(p[g9+5u],0.0f,1.0f), g=clamp(p[g9+6u],0.0f,1.0f), b=clamp(p[g9+7u],0.0f,1.0f);
+    float a=SigmoidF(p[g9+8u]);
+    float dx=cx-mx, dy=cy-my;
+    float m=max(sx,sy); float r2=(3.0f*m)*(3.0f*m);
+    float ex=0.0f, ey=0.0f, gv=0.0f;
+    if (dx*dx+dy*dy <= r2){
+      ex=(cs*dx+sn*dy)/sx; ey=(-sn*dx+cs*dy)/sy;
+      gv=exp(-0.5f*(ex*ex+ey*ey));
+    }
+    float alpha=a*gv;
+    uint fp=fbase+k*4u;
+    fwd[fp]=alpha; fwd[fp+1u]=T; fwd[fp+2u]=ex; fwd[fp+3u]=ey;
+    acc += vec3(r,g,b)*(alpha*T);
+    T *= 1.0f-alpha;
+  }
+  acc = clamp(acc, 0.0f, 1.0f);
+  pcol[seq*3u]=acc.x; pcol[seq*3u+1u]=acc.y; pcol[seq*3u+2u]=acc.z;
+  if (valid[gid] != 0u){
+    uint k3 = gid*3u;
+    vec3 d = acc - vec3(tgt[k3], tgt[k3+1u], tgt[k3+2u]);
+    // loss/l2 用 1e5 定点（1e6 在 batch 大时 uint32 累加可能溢出）
+    atomicAdd(stat[0], uint((abs(d.x)+abs(d.y)+abs(d.z))*1e5f+0.5f));
+    atomicAdd(stat[1], uint((d.x*d.x+d.y*d.y+d.z*d.z)*1e5f+0.5f));
+    atomicAdd(stat[2], 1u);
+  }
+}
+)GLSL";
+
+// 反传：与 CPU BackwardPixel2 完全一致的 alpha 合成 backward 递推 + 9 参数解析梯度。
+// 注意：Intel 核显 GLSL 4.30 不支持 float atomicAdd（GL_ARB_shader_atomic_float 未启用），
+// 梯度用 int32 定点（×65536）原子累加，Adam pass 转回 float——精度 1.5e-5，足够训练。
+static const char* kGpuTrainBwd = R"GLSL(
+#version 430 core
+layout(local_size_x=8, local_size_y=8) in;
+layout(std430,binding=0) buffer BP { float p[]; };
+layout(std430,binding=1) buffer BT { float tgt[]; };
+layout(std430,binding=2) buffer BV { uint valid[]; };
+layout(std430,binding=3) buffer BOff { uint off[]; };
+layout(std430,binding=4) buffer BCnt { uint cnt[]; };
+layout(std430,binding=5) buffer BIdx { uint idx[]; };
+layout(std430,binding=6) buffer BTxy { uint txy[]; };
+layout(std430,binding=7) buffer BFwd { float fwd[]; };
+layout(std430,binding=8) buffer BPc  { float pcol[]; };
+layout(std430,binding=9) buffer BG   { int grad[]; };     // int32 定点 ×65536
+layout(std430,binding=11) buffer BStat { uint stat[]; };
+layout(std430,binding=12) buffer BMark { uint mark[]; };
+layout(std430,binding=13) buffer BTch  { uint tch[]; };
+uniform uint uImgW, uImgH, uTCOLS, uMaxPl;
+uniform int uL2;
+float SigmoidF(float x){ return 1.0f/(1.0f+exp(-x)); }
+void main(){
+  uint wg=gl_WorkGroupID.x, t=gl_LocalInvocationIndex;
+  uint tx=txy[wg*2u], ty=txy[wg*2u+1u];
+  uint tile=ty*uTCOLS+tx;
+  uint n=cnt[tile], base=off[tile];
+  uint px=tx*8u+t%8u, py=ty*8u+t/8u;
+  uint gid=py*uImgW+px;
+  uint seq=wg*64u+t;
+  if (px>=uImgW||py>=uImgH) return;
+  if (valid[gid]==0u) return;
+  uint k3=gid*3u;
+  float accR=pcol[seq*3u], accG=pcol[seq*3u+1u], accB=pcol[seq*3u+2u];
+  float dR=accR-tgt[k3], dG=accG-tgt[k3+1u], dB=accB-tgt[k3+2u];
+  float eR,eG,eB;
+  if (uL2==1){ eR=2.0f*dR; eG=2.0f*dG; eB=2.0f*dB; }
+  // copysign 在部分 Intel 核显驱动未实现，用三元等价（copysign(1.0,0)=+1.0，与 CPU copysignf 一致）
+  else { eR=(dR>=0.0f)?1.0f:-1.0f; eG=(dG>=0.0f)?1.0f:-1.0f; eB=(dB>=0.0f)?1.0f:-1.0f; }
+  uint fbase=seq*uMaxPl*4u;
+  float gradT=0.0f;
+  for (uint i2=0u;i2<n;++i2){
+    uint ii=n-1u-i2;
+    uint gi=idx[base+ii];
+    uint g9=gi*9u;
+    uint fp=fbase+ii*4u;
+    float alp=fwd[fp], Ti=fwd[fp+1u], ex=fwd[fp+2u], ey=fwd[fp+3u];
+    float a=SigmoidF(p[g9+8u]);
+    float r=clamp(p[g9+5u],0.0f,1.0f), g=clamp(p[g9+6u],0.0f,1.0f), b=clamp(p[g9+7u],0.0f,1.0f);
+    float eC=eR*r+eG*g+eB*b;
+    float dAlp=eC*Ti-gradT*Ti;
+    float dTi=eC*alp+gradT*(1.0f-alp);
+    gradT=dTi;
+    float gv = (a>1e-12f) ? alp/a : 0.0f;
+    float dA=dAlp*gv;
+    float dG=dAlp*a;
+    // 定点 ×256：8 位小数，除以 nv 后截断误差 ~1e-5；比 ×65536 抗早期大 splat 的多像素累加溢出
+    atomicAdd(grad[g9+8u], int(dA*a*(1.0f-a)*256.0f));
+    atomicAdd(grad[g9+5u], int(eR*alp*Ti*256.0f));
+    atomicAdd(grad[g9+6u], int(eG*alp*Ti*256.0f));
+    atomicAdd(grad[g9+7u], int(eB*alp*Ti*256.0f));
+    float w=dG*gv;
+    if (w!=0.0f){
+      float cs=cos(p[g9+4u]), sn=sin(p[g9+4u]);
+      float sx=exp(p[g9+2u]), sy=exp(p[g9+3u]);
+      atomicAdd(grad[g9], int(w*(ex*cs/sx-ey*sn/sy)*256.0f));
+      atomicAdd(grad[g9+1u], int(w*(ex*sn/sx+ey*cs/sy)*256.0f));
+      atomicAdd(grad[g9+2u], int(w*ex*ex*256.0f));
+      atomicAdd(grad[g9+3u], int(w*ey*ey*256.0f));
+      float dxp=cs*(ex*sx)-sn*(ey*sy);
+      float dyp=sn*(ex*sx)+cs*(ey*sy);
+      float u1r=-sn*dxp+cs*dyp;
+      float v1r=-cs*dxp-sn*dyp;
+      atomicAdd(grad[g9+4u], int(w*(-ex*u1r/sx-ey*v1r/sy)*256.0f));
+    }
+    // 稀疏 touch 收集：w==0 时所有梯度为 0，无需进 Adam
+    if (w!=0.0f && mark[gi]==0u){
+      uint old=atomicExchange(mark[gi],1u);
+      if (old==0u){ uint slot=atomicAdd(stat[3],1u); tch[slot]=gi; }
+    }
+  }
+}
+)GLSL";
+
+// 稀疏 Adam：只更新本迭代 touch 的 splat（零梯度 splat 无需更新，与 CPU 稀疏梯度一致）
+static const char* kGpuTrainAdam = R"GLSL(
+#version 430 core
+layout(local_size_x=256) in;
+layout(std430,binding=0) buffer BP { float p[]; };
+layout(std430,binding=9) buffer BG { int grad[]; };       // int32 定点 ×65536
+layout(std430,binding=10) buffer BM { float mom[]; };
+layout(std430,binding=13) buffer BTch { uint tch[]; };
+layout(std430,binding=14) buffer BGA { float ga[]; };
+layout(std430,binding=15) buffer BVel { float vel[]; };
+uniform uint uTouch;
+uniform float uInvNv, uLrScale, uBc1, uBc2;
+uniform float kLr[9];
+uniform uint uImgW, uImgH;
+void main(){
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= uTouch) return;
+  uint gi = tch[i];
+  uint g9 = gi*9u;
+  float g0=0.0f, g1=0.0f;
+  for (uint c=0u;c<9u;++c){
+    uint idx=g9+c;
+    float g = float(grad[idx]) / 256.0f * uInvNv;   // 定点转回 float 并按有效像素平均
+    if (c==0u) g0=abs(g); if (c==1u) g1=abs(g);
+    float m=0.9f*mom[idx]+0.1f*g;
+    float v=0.999f*vel[idx]+0.001f*g*g;
+    mom[idx]=m; vel[idx]=v;
+    float mh=m/uBc1, vh=v/uBc2;
+    float step=clamp(mh/(sqrt(vh)+1e-3f), -1.0f, 1.0f);
+    p[idx] -= kLr[c]*uLrScale*step;
+    grad[idx]=0;
+  }
+  ga[gi*2u]+=g0; ga[gi*2u+1u]+=g1;   // gradAcc 非原子：每个 splat 只被一个 workgroup 处理一次
+  p[g9]=clamp(p[g9],0.0f,float(uImgW));
+  p[g9+1u]=clamp(p[g9+1u],0.0f,float(uImgH));
+  float sx=exp(p[g9+2u]); if (sx<0.05f)sx=0.05f; if (sx>float(uImgW))sx=float(uImgW); p[g9+2u]=log(sx);
+  float sy=exp(p[g9+3u]); if (sy<0.05f)sy=0.05f; if (sy>float(uImgH))sy=float(uImgH); p[g9+3u]=log(sy);
+  p[g9+5u]=clamp(p[g9+5u],0.0f,1.0f);
+  p[g9+6u]=clamp(p[g9+6u],0.0f,1.0f);
+  p[g9+7u]=clamp(p[g9+7u],0.0f,1.0f);
+}
+)GLSL";
+
+// 创建 GLFW 隐藏窗口 4.3 core 上下文并加载 glad（与 GpuForwardTest 共用模式）
+static GLFWwindow* GpuCreateCtx() {
+    if (!glfwInit()) { printf("[gputrain] glfwInit 失败\n"); return nullptr; }
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    GLFWwindow* win = glfwCreateWindow(16, 16, "fitsplat-gputrain", nullptr, nullptr);
+    if (!win) { printf("[gputrain] 创建 4.3 core 上下文失败\n"); glfwTerminate(); return nullptr; }
+    glfwMakeContextCurrent(win);
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+        printf("[gputrain] gladLoadGL 失败\n"); glfwTerminate(); return nullptr;
+    }
+    printf("[gputrain] 上下文: OpenGL %s, GLSL %s, 渲染器 %s\n",
+           glGetString(GL_VERSION), glGetString(GL_SHADING_LANGUAGE_VERSION), glGetString(GL_RENDERER));
+    return win;
+}
+
+// 编译单个 compute program，失败打印日志并返回 0
+static GLuint GpuCompile(const char* src, const char* name) {
+    GLuint cs = glCreateShader(GL_COMPUTE_SHADER);
+    glShaderSource(cs, 1, &src, nullptr);
+    glCompileShader(cs);
+    GLint ok = 0; glGetShaderiv(cs, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[8192]; glGetShaderInfoLog(cs, 8192, nullptr, log);
+        printf("[gputrain] %s 编译失败:\n%s\n", name, log);
+        glDeleteShader(cs); return 0;
+    }
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, cs); glLinkProgram(prog);
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[8192]; glGetProgramInfoLog(prog, 8192, nullptr, log);
+        printf("[gputrain] %s 链接失败:\n%s\n", name, log);
+        glDeleteShader(cs); glDeleteProgram(prog); return 0;
+    }
+    glDeleteShader(cs);
+    return prog;
+}
+
+// GPU 训练主循环：正传/反传/Adam 全部在 compute shader 执行，CPU 只做 tile 采样、
+// 密度控制（每 100 迭代读回跑 Densify）与进度显示。结束后把参数写回全局 splats。
+static void GpuTrainLoop(int startIt, int iters, int nTile, size_t maxK, int previewPct,
+                         const std::string& ckptPath, int ckptEvery, int l2loss, std::mt19937& rng) {
+    const int TSg = TS;   // 8x8 训练 tile
+    GLFWwindow* win = GpuCreateCtx();
+    if (!win) return;
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) { glfwTerminate(); return; }
+
+    // 编译 4 个 pass
+    GLuint progZero = GpuCompile(kGpuTrainZero, "zero");
+    GLuint progFwd  = GpuCompile(kGpuTrainFwd, "fwd");
+    GLuint progBwd  = GpuCompile(kGpuTrainBwd, "bwd");
+    GLuint progAdam = GpuCompile(kGpuTrainAdam, "adam");
+    if (!progZero || !progFwd || !progBwd || !progAdam) {
+        glfwTerminate(); return;
+    }
+
+    // 构建 tile 分块（8x8，训练口径，cap=0 不截断）
+    TileMap tMap;
+    BuildTileMap(splats, TSg, tMap);
+    int TCOLS = tMap.TCOLS;
+    uint32_t maxPl = 0;
+    for (uint32_t c : tMap.cnt) maxPl = std::max(maxPl, c);
+    uint32_t maxPlInit = maxPl;   // fwd buffer 的分配上限，密度控制后只增不减
+    int NS = (int)splats.size();
+    printf("[gputrain] NS=%d tile=%dx%d maxPl=%d nTile=%d\n", NS, TCOLS, tMap.TROWS, (int)maxPl, nTile);
+
+    // ---------- 打包上传数据 ----------
+    std::vector<float> p((size_t)NS * 9), mom((size_t)NS * 9), vel((size_t)NS * 9), ga((size_t)NS * 2);
+    for (int i = 0; i < NS; ++i) {
+        std::array<float, 9> q = { splats[i].mx, splats[i].my, logf(splats[i].sx), logf(splats[i].sy),
+                                   splats[i].rot, splats[i].r, splats[i].g, splats[i].b, Logit(splats[i].a) };
+        for (int c = 0; c < 9; ++c) { p[(size_t)i * 9 + c] = q[c]; mom[(size_t)i * 9 + c] = mAdam[i][c]; vel[(size_t)i * 9 + c] = vAdam[i][c]; }
+        ga[(size_t)i * 2] = gradAcc[i][0]; ga[(size_t)i * 2 + 1] = gradAcc[i][1];
+    }
+    std::vector<uint32_t> validU(W * H);
+    for (int i = 0; i < W * H; ++i) validU[i] = valid[i] ? 1u : 0u;
+
+    // SSBO 布局（binding 号与 shader 一致）
+    enum { BP=0, BT=1, BV=2, BO=3, BC=4, BI=5, BTX=6, BFW=7, BPC=8, BGR=9, BMM=10, BST=11, BMK=12, BTC=13, BGA=14, BVL=15 };
+    GLuint sbo[16] = {};
+    auto mk = [&](int b, size_t bytes, const void* data) {
+        glGenBuffers(1, &sbo[b]);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, sbo[b]);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)bytes, data, GL_DYNAMIC_DRAW);
+    };
+    size_t npix = (size_t)nTile * 64;
+    mk(BP,  p.size() * 4, p.data());
+    mk(BT,  target.size() * 4, target.data());
+    mk(BV,  validU.size() * 4, validU.data());
+    mk(BO,  tMap.off.size() * 4, tMap.off.data());
+    mk(BC,  tMap.cnt.size() * 4, tMap.cnt.data());
+    mk(BI,  tMap.idx.size() * 4, tMap.idx.data());
+    mk(BTX, (size_t)nTile * 2 * 4, nullptr);
+    mk(BFW, npix * maxPl * 4 * 4, nullptr);
+    mk(BPC, npix * 3 * 4, nullptr);
+    mk(BGR, p.size() * 4, nullptr);          // grad 初始 0
+    mk(BMM, p.size() * 4, mom.data());
+    mk(BST, 3 * 4, nullptr);
+    mk(BMK, (size_t)NS * 4, nullptr);
+    mk(BTC, (size_t)NS * 4, nullptr);
+    mk(BGA, ga.size() * 4, ga.data());
+    mk(BVL, p.size() * 4, vel.data());
+    // grad 显式清零
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, sbo[BGR]);
+    std::vector<float> zero(p.size(), 0.0f);
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(zero.size() * 4), zero.data());
+
+    // uniform 定位
+    GLuint uF_W=glGetUniformLocation(progFwd,"uImgW"), uF_H=glGetUniformLocation(progFwd,"uImgH"),
+           uF_T=glGetUniformLocation(progFwd,"uTCOLS"), uF_M=glGetUniformLocation(progFwd,"uMaxPl");
+    GLuint uB_W=glGetUniformLocation(progBwd,"uImgW"), uB_H=glGetUniformLocation(progBwd,"uImgH"),
+           uB_T=glGetUniformLocation(progBwd,"uTCOLS"), uB_M=glGetUniformLocation(progBwd,"uMaxPl"),
+           uB_L=glGetUniformLocation(progBwd,"uL2");
+    GLuint uZ_N=glGetUniformLocation(progZero,"uN");
+    GLuint uA_T=glGetUniformLocation(progAdam,"uTouch"), uA_I=glGetUniformLocation(progAdam,"uInvNv"),
+           uA_L=glGetUniformLocation(progAdam,"uLrScale"), uA_C1=glGetUniformLocation(progAdam,"uBc1"),
+           uA_C2=glGetUniformLocation(progAdam,"uBc2"), uA_K=glGetUniformLocation(progAdam,"kLr"),
+           uA_W=glGetUniformLocation(progAdam,"uImgW"), uA_H=glGetUniformLocation(progAdam,"uImgH");
+    const float kLrG[9] = { 0.010f,0.010f,0.004f,0.004f,0.010f,0.020f,0.020f,0.020f,0.030f };
+    glUseProgram(progAdam); glUniform1fv(uA_K, 9, kLrG);
+
+    auto bindAll = [&]() {
+        glUseProgram(progZero);
+        for (int i = 0; i < 16; ++i) glBindBufferBase(GL_SHADER_STORAGE_BUFFER, i, sbo[i]);
+        glUniform1ui(uZ_N, (GLuint)NS);
+        glUseProgram(progFwd);
+        glUniform1ui(uF_W, (GLuint)W); glUniform1ui(uF_H, (GLuint)H);
+        glUniform1ui(uF_T, (GLuint)TCOLS); glUniform1ui(uF_M, maxPl);
+        glUseProgram(progBwd);
+        glUniform1ui(uB_W, (GLuint)W); glUniform1ui(uB_H, (GLuint)H);
+        glUniform1ui(uB_T, (GLuint)TCOLS); glUniform1ui(uB_M, maxPl);
+        glUniform1i(uB_L, l2loss);
+        glUseProgram(progAdam);
+        glUniform1ui(uA_W, (GLuint)W); glUniform1ui(uA_H, (GLuint)H);
+    };
+    bindAll();
+
+    std::vector<uint32_t> txy((size_t)nTile * 2);
+    std::uniform_int_distribution<int> txr(0, (W + TSg - 1) / TSg - 1), tyr(0, (H + TSg - 1) / TSg - 1);
+
+    // 计时与进度
+    double t0 = NowSec(); float lossEma = 0; int prevPct = -1, prevBmpPct = -1;
+    double prof_pass = 0;   // GPU pass 耗时
+    double dispPsnr = 0;    // 进度显示 PSNR：每 previewPct 用全图 Evaluate 刷新（采样 l1 无法直接转 PSNR）
+    for (int it = startIt + 1; it <= iters; ++it) {
+        double tIt0 = NowSec();
+        // 1) 随机 tile 采样 + 上传
+        for (int b = 0; b < nTile; ++b) { txy[(size_t)b * 2] = (uint32_t)txr(rng); txy[(size_t)b * 2 + 1] = (uint32_t)tyr(rng); }
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, sbo[BTX]);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(txy.size() * 4), txy.data());
+        // 2) zero -> fwd -> bwd -> adam
+        glUseProgram(progZero); glDispatchCompute((GLuint)((NS + 255) / 256), 1, 1);
+        glUseProgram(progFwd);  glDispatchCompute((GLuint)nTile, 1, 1);
+        glUseProgram(progBwd);  glDispatchCompute((GLuint)nTile, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        // 3) 读回统计（loss/l2/nv/touchCnt）：glFinish 等 fwd/bwd 写完 stat 再 map 读
+        glFinish();
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, sbo[BST]);
+        uint32_t st3[4] = {};
+        void* sp = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, 16, GL_MAP_READ_BIT);
+        if (sp) memcpy(st3, sp, 16); glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+        uint32_t touch = st3[3];
+        // 4) adam（只处理 touch 的 splat）
+        glUseProgram(progAdam);
+        glUniform1ui(uA_T, touch);
+        glUniform1f(uA_I, touch > 0 ? 1.0f / std::max(1, (int)st3[2]) : 0.0f);
+        glUniform1f(uA_L, 0.3f + 0.7f * (1.0f - (float)it / iters));
+        float bc1 = 1.0f - powf(0.9f, (float)it), bc2 = 1.0f - powf(0.999f, (float)it);
+        glUniform1f(uA_C1, bc1); glUniform1f(uA_C2, bc2);
+        if (touch > 0) glDispatchCompute((GLuint)((touch + 255) / 256), 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+        prof_pass += NowSec() - tIt0;
+
+        // 5) 损失/进度显示（loss = L1 采样值，psnr = L2 每通道口径 EMA，与 CPU 一致）
+        float l1 = (float)st3[0] / 1e5f / std::max(1u, st3[2]);
+        float l2e = (float)st3[1] / 1e5f / std::max(1u, st3[2]);
+        lossEma = (it == 1) ? l1 : (0.95f * lossEma + 0.05f * l1);
+        double psnrEma = 10.0 * log10(3.0 / std::max((double)l2e, 1e-6));
+        int pct = (int)(100.0 * it / iters);
+        if (pct != prevPct && pct % 2 == 0) {
+            prevPct = pct;
+            double dt = NowSec() - t0, eta = dt * (iters - it) / std::max(1, it);
+            double ps = dispPsnr > 0 ? dispPsnr : psnrEma;   // 有全图评估用全图值，否则用采样 EMA
+            printf("\r[%s] %3d%% iter=%d/%d  l1=%.4f psnr=%.1fdb  splats=%d  dt=%.0fs  eta=%.0fs [gpu %.2fms]",
+                   std::string(pct / 5, '=').c_str(), pct, it, iters, lossEma, ps, NS, dt, eta, prof_pass / it * 1000);
+            fflush(stdout);
+        }
+        if (previewPct > 0 && pct / previewPct != prevBmpPct && pct >= previewPct) {
+            prevBmpPct = pct / previewPct;
+            // 预览需要 CPU splats：读回 p 后 Evaluate（只读回，不改 GPU 状态）
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, sbo[BP]);
+            void* mp = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(p.size() * 4), GL_MAP_READ_BIT);
+            if (mp) {
+                memcpy(p.data(), mp, p.size() * 4); glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+                for (int i = 0; i < NS; ++i) {
+                    std::array<float, 9> q = { p[(size_t)i*9], p[(size_t)i*9+1], p[(size_t)i*9+2], p[(size_t)i*9+3],
+                                               p[(size_t)i*9+4], p[(size_t)i*9+5], p[(size_t)i*9+6], p[(size_t)i*9+7], p[(size_t)i*9+8] };
+                    SplatFromParams(splats[i], q);
+                }
+                double mE = Evaluate(nullptr, "fitsplat_progress.bmp");
+                dispPsnr = 10.0 * log10(1.0 / std::max(mE, 1e-6));
+            }
+        }
+
+        // 6) 密度控制：每 100 迭代读回参数跑 CPU Densify，重传（数据结构调整只能在 CPU 做）
+        if (it % 100 == 0) {
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, sbo[BP]);
+            void* mp = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(p.size() * 4), GL_MAP_READ_BIT);
+            if (mp) memcpy(p.data(), mp, p.size() * 4);
+            glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, sbo[BGA]);
+            void* mg = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(ga.size() * 4), GL_MAP_READ_BIT);
+            if (mg) memcpy(ga.data(), mg, ga.size() * 4);
+            glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+            // 动量/二阶矩也在 GPU 上累积，读回才能避免重传时用陈旧 mAdam 重置 Adam 状态
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, sbo[BMM]);
+            void* mm = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(mom.size() * 4), GL_MAP_READ_BIT);
+            if (mm) memcpy(mom.data(), mm, mom.size() * 4);
+            glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, sbo[BVL]);
+            void* mv = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(vel.size() * 4), GL_MAP_READ_BIT);
+            if (mv) memcpy(vel.data(), mv, vel.size() * 4);
+            glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+            for (int i = 0; i < NS; ++i) {
+                std::array<float, 9> q = { p[(size_t)i*9], p[(size_t)i*9+1], p[(size_t)i*9+2], p[(size_t)i*9+3],
+                                           p[(size_t)i*9+4], p[(size_t)i*9+5], p[(size_t)i*9+6], p[(size_t)i*9+7], p[(size_t)i*9+8] };
+                SplatFromParams(splats[i], q);
+                gradAcc[i][0] = ga[(size_t)i * 2]; gradAcc[i][1] = ga[(size_t)i * 2 + 1];
+                for (int c = 0; c < 9; ++c) { mAdam[i][c] = mom[(size_t)i * 9 + c]; vAdam[i][c] = vel[(size_t)i * 9 + c]; }
+            }
+            Densify(maxK, rng);
+            for (auto& g : gradAcc) { g[0] = 0; g[1] = 0; }
+            BuildTileMap(splats, TSg, tMap);
+            TCOLS = tMap.TCOLS;
+            maxPl = 0; for (uint32_t c : tMap.cnt) maxPl = std::max(maxPl, c);
+            NS = (int)splats.size();
+            // 重传 p/mom/vel/ga（NS 已变）+ 重建 tile buffer + grad/mark/tch 重分配
+            p.resize((size_t)NS * 9); mom.resize((size_t)NS * 9); vel.resize((size_t)NS * 9); ga.resize((size_t)NS * 2);
+            for (int i = 0; i < NS; ++i) {
+                std::array<float, 9> q = { splats[i].mx, splats[i].my, logf(splats[i].sx), logf(splats[i].sy),
+                                           splats[i].rot, splats[i].r, splats[i].g, splats[i].b, Logit(splats[i].a) };
+                for (int c = 0; c < 9; ++c) { p[(size_t)i * 9 + c] = q[c]; mom[(size_t)i * 9 + c] = mAdam[i][c]; vel[(size_t)i * 9 + c] = vAdam[i][c]; }
+                ga[(size_t)i * 2] = 0; ga[(size_t)i * 2 + 1] = 0;
+            }
+            auto up = [&](int b, size_t bytes, const void* d) {
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, sbo[b]);
+                glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)bytes, d, GL_DYNAMIC_DRAW);
+            };
+            std::vector<float> zeroG(p.size(), 0.0f);   // NS 变化后按新大小重建清零缓冲
+            up(BP, p.size() * 4, p.data());
+            up(BMM, p.size() * 4, mom.data());
+            up(BVL, p.size() * 4, vel.data());
+            up(BGA, ga.size() * 4, ga.data());
+            up(BGR, p.size() * 4, zeroG.data());
+            up(BO, tMap.off.size() * 4, tMap.off.data());
+            up(BC, tMap.cnt.size() * 4, tMap.cnt.data());
+            up(BI, tMap.idx.size() * 4, tMap.idx.data());
+            std::vector<uint32_t> mz((size_t)NS, 0u);
+            up(BMK, mz.size() * 4, mz.data());
+            up(BTC, mz.size() * 4, mz.data());
+            // splat 分裂可能让某些 tile 覆盖更多 splat（maxPl 增大），fwd buffer 按新 maxPl 重分配防越界
+            if (maxPl > maxPlInit) {
+                up(BFW, npix * maxPl * 4 * 4, nullptr);
+                maxPlInit = maxPl;
+            }
+            glUniform1ui(uZ_N, (GLuint)NS);
+            glUseProgram(progFwd); glUniform1ui(uF_T, (GLuint)TCOLS); glUniform1ui(uF_M, maxPl);
+            glUseProgram(progBwd); glUniform1ui(uB_T, (GLuint)TCOLS); glUniform1ui(uB_M, maxPl);
+            glUseProgram(progAdam); glUniform1ui(uA_W, (GLuint)W); glUniform1ui(uA_H, (GLuint)H);
+            printf("\n[gputrain] 密度控制 iter=%d splats=%d\n", it, NS);
+        }
+
+        // checkpoint（GPU 版每 ckptEvery 迭代读回参数保存，供 --resume 继续）
+        if (!ckptPath.empty() && it % ckptEvery == 0) {
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, sbo[BP]);
+            void* mp = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(p.size() * 4), GL_MAP_READ_BIT);
+            if (mp) memcpy(p.data(), mp, p.size() * 4);
+            glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+            for (int i = 0; i < NS; ++i) {
+                std::array<float, 9> q = { p[(size_t)i*9], p[(size_t)i*9+1], p[(size_t)i*9+2], p[(size_t)i*9+3],
+                                           p[(size_t)i*9+4], p[(size_t)i*9+5], p[(size_t)i*9+6], p[(size_t)i*9+7], p[(size_t)i*9+8] };
+                SplatFromParams(splats[i], q);
+            }
+            // 复用 main 里的 checkpoint 保存逻辑（独立实现，避免依赖 main 作用域 lambda）
+            FILE* f = nullptr; fopen_s(&f, ckptPath.c_str(), "wb");
+            if (f) {
+                uint32_t magic = 0x46535350u; int ns = (int)splats.size();
+                fwrite(&magic, 4, 1, f); fwrite(&it, 4, 1, f); fwrite(&ns, 4, 1, f);
+                for (int i = 0; i < ns; ++i) {
+                    std::array<float, 9> q = { splats[i].mx, splats[i].my, logf(splats[i].sx), logf(splats[i].sy),
+                                               splats[i].rot, splats[i].r, splats[i].g, splats[i].b, Logit(splats[i].a) };
+                    fwrite(q.data(), 4, 9, f);
+                    fwrite(mAdam[i].data(), 4, 9, f);
+                    fwrite(vAdam[i].data(), 4, 9, f);
+                    fwrite(gradAcc[i].data(), 4, 2, f);
+                }
+                fclose(f);
+                printf("\n[gputrain] checkpoint it=%d splats=%d -> %s\n", it, ns, ckptPath.c_str());
+            }
+        }
+    }
+    printf("\n");
+
+    // 训练结束：读回最终参数到全局 splats（供 main 后续 Evaluate/输出 GLSL）
+    p.resize((size_t)NS * 9);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, sbo[BP]);
+    void* mp = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(p.size() * 4), GL_MAP_READ_BIT);
+    if (mp) memcpy(p.data(), mp, p.size() * 4);
+    glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, sbo[BGA]);
+    void* mg = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(ga.size() * 4), GL_MAP_READ_BIT);
+    if (mg) memcpy(ga.data(), mg, ga.size() * 4);
+    glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, sbo[BMM]);
+    void* mm2 = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(mom.size() * 4), GL_MAP_READ_BIT);
+    if (mm2) memcpy(mom.data(), mm2, mom.size() * 4);
+    glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, sbo[BVL]);
+    void* mv2 = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(vel.size() * 4), GL_MAP_READ_BIT);
+    if (mv2) memcpy(vel.data(), mv2, vel.size() * 4);
+    glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+    for (int i = 0; i < NS; ++i) {
+        std::array<float, 9> q = { p[(size_t)i*9], p[(size_t)i*9+1], p[(size_t)i*9+2], p[(size_t)i*9+3],
+                                   p[(size_t)i*9+4], p[(size_t)i*9+5], p[(size_t)i*9+6], p[(size_t)i*9+7], p[(size_t)i*9+8] };
+        SplatFromParams(splats[i], q);
+        gradAcc[i][0] = ga[(size_t)i * 2]; gradAcc[i][1] = ga[(size_t)i * 2 + 1];
+        for (int c = 0; c < 9; ++c) { mAdam[i][c] = mom[(size_t)i * 9 + c]; vAdam[i][c] = vel[(size_t)i * 9 + c]; }
+    }
+    if ((int)splats.size() > NS) splats.resize(NS);
+    else if ((int)splats.size() < NS) { splats.resize(NS); mAdam.resize(NS); vAdam.resize(NS); gradAcc.resize(NS); }
+    printf("[gputrain] 训练结束: splats=%d 平均 %.2f ms/迭代\n", NS, prof_pass / std::max(1, iters - startIt) * 1000);
+
+    for (int i = 0; i < 16; ++i) if (sbo[i]) glDeleteBuffers(1, &sbo[i]);
+    glDeleteProgram(progZero); glDeleteProgram(progFwd); glDeleteProgram(progBwd); glDeleteProgram(progAdam);
+    glfwTerminate();
 }
 
 int main(int argc, char** argv) {
@@ -402,7 +1148,10 @@ int main(int argc, char** argv) {
     int    tilecap = 1024;   // 输出产物每 tile 索引上限；0 = 不截断（渲染全部 splat，画质最佳）
     int    dumpTarget = 0;   // 调试：dump target 像素（float）到 target.raw
     int    residual = 0;     // embed 产物附加"残差修正层"（4bit/通道 ±64，叠加补高频细节，可再提 ~7dB）
+    int    gpu = 0;          // 1=训练完成后跑 GPU 前向 tile 渲染基准（OpenGL 4.3 compute，需核显支持）
+    int    gputrain = 0;     // 1=训练模式切到 GPU compute（正传/反传/Adam 全 GPU，密度控制 CPU 化）
     float  bg     = 0.0f;
+    float  targetPsnr = 0.0f;   // --target：EMA PSNR 达到该值即提前停止训练（0 = 不启用）
     std::string outPath = "fitsplat.glsl";
     std::string ckptPath, resumePath;
     int ckptEvery = 2000;
@@ -417,6 +1166,8 @@ int main(int argc, char** argv) {
         else if (k == "--out")      outPath = next();
         else if (k == "--threads")  threads = atoi(next());
         else if (k == "--bg")       bg     = (float)atof(next());
+        else if (k == "--target")   targetPsnr = (float)atof(next());   // 达到目标 PSNR 提前停止
+        else if (k == "--gputrain") gputrain = atoi(next());            // 训练切到 GPU compute
         else if (k == "--seed")     seed   = atoi(next());
         else if (k == "--preview")  previewPct = atoi(next());
         else if (k == "--embed")    embed  = atoi(next());
@@ -427,6 +1178,7 @@ int main(int argc, char** argv) {
         else if (k == "--resume")   resumePath = next();    // 从 checkpoint 恢复，跳过已完成的迭代
         else if (k == "--tilecap")  tilecap = atoi(next()); // 输出 tile 索引上限（0=不截断）
         else if (k == "--residual") residual = atoi(next()); // 1=embed 产物附带残差修正层
+        else if (k == "--gpu")      gpu = atoi(next());       // 1=训练完成后跑 GPU 前向 tile 渲染基准
         else if (k == "--dump-target") dumpTarget = atoi(next());
         else { printf("未知参数: %s\n", k.c_str()); return 1; }
     }
@@ -631,6 +1383,7 @@ int main(int argc, char** argv) {
     };
     float lossEma = 0, mseEma = 0;
     int   prevPct = -1, prevBmpPct = -1;
+    int   lastPct10 = 0;   // --target 检查点：每跨过总迭代 10% 检查一次（固定 10 次全图评估，与迭代总数无关）
     size_t maxK = (size_t)(K0 * 3.0);   // 密度控制上限放宽到 3x（接近无损复刻需要更大 splat 规模）
 
     // tile 分块（训练核心加速：每像素只遍历本 tile 的 splat，剔除 99% 无关 splat）
@@ -641,6 +1394,12 @@ int main(int argc, char** argv) {
     double prof_tile = 0, prof_adam = 0, prof_other = 0;
 
     for (int it = startIt + 1; it <= iters; ++it) {
+        // GPU 训练模式：正传/反传/Adam 全部在 compute shader 执行，跑完后直接收尾
+        if (gputrain) {
+            GpuTrainLoop(startIt, iters, nTile, maxK, previewPct, ckptPath, ckptEvery, l2loss, rng);
+            it = iters;   // 循环结束（GpuTrainLoop 内部跑完所有迭代）
+            break;
+        }
         double tIt0 = NowSec();
         for (int b = 0; b < nTile; ++b) { tileX[b] = txr(rng); tileY[b] = tyr(rng); }
 
@@ -811,16 +1570,36 @@ int main(int argc, char** argv) {
         lossEma = (it == 1) ? totalL1 : (0.95f * lossEma + 0.05f * totalL1);
         mseEma  = (it == 1) ? totalL2 : (0.95f * mseEma  + 0.05f * totalL2);
 
+        // 每通道口径 EMA PSNR（mseEma 是三通道和，除以 3 与全图 Evaluate 的 PSNR 口径一致）
+        double psnr = 10.0 * log10(3.0 / std::max(mseEma, 1e-6f));
+        double dispPsnr = psnr;   // 进度条显示值：每 200 迭代刷新为全图真实 PSNR，避免 EMA 采样口径虚高
+
+        // 提前停止：每跨过总迭代 10% 检查一次全图真实 PSNR（Evaluate 口径，随机采样 tile 的
+        // EMA 会系统性偏高 10+ dB，不能用于目标判断），达到 --target 即结束。
+        // 动态 10% 粒度：15K 迭代 ≈ 每 1500 次检查，50K 迭代 ≈ 每 5000 次检查，
+        // 全图评估固定只跑 ~10 次，不会随迭代数放大开销
+        int pctNow = (int)(100.0 * it / iters);
+        if (targetPsnr > 0 && pctNow >= lastPct10 + 10) {
+            lastPct10 = pctNow - pctNow % 10;
+            double mEval = Evaluate();   // 全图 MSE（每通道）
+            double pEval = 10.0 * log10(1.0 / std::max(mEval, 1e-6));
+            dispPsnr = pEval;
+            if (pEval >= targetPsnr) {
+                printf("\n[目标] iter=%d 全图 PSNR=%.2f dB 达到目标 %.1f dB，提前停止训练\n", it, pEval, targetPsnr);
+                iters = it;   // 后续 saveCkpt / 最终评估以实际迭代数为准
+                break;
+            }
+        }
+
         // 进度反馈
         int pct = (int)(100.0 * it / iters);
         if (pct != prevPct && pct % 2 == 0) {
             prevPct = pct;
             double dt = NowSec() - t0;
             double eta = dt * (iters - it) / std::max(1, it);
-            double psnr = 10.0 * log10(1.0 / std::max(mseEma, 1e-6f));
             int barN = 20, fill = (int)(barN * pct / 100.0);
             printf("\r[%s] %3d%% iter=%d/%d  l1=%.4f psnr=%.1fdb  splats=%d  dt=%.0fs  eta=%.0fs",
-                   std::string(fill, '=').c_str(), pct, it, iters, lossEma, psnr, (int)splats.size(), dt, eta);
+                   std::string(fill, '=').c_str(), pct, it, iters, lossEma, dispPsnr, (int)splats.size(), dt, eta);
             if (it >= 50) printf("  [tile %.2fms adam %.2fms other %.2fms]", prof_tile / it * 1000, prof_adam / it * 1000, prof_other / it * 1000);
             fflush(stdout);
         }
@@ -854,6 +1633,12 @@ int main(int argc, char** argv) {
     float ssim = EvaluateSSIM();
     printf("训练完成: 最终 splat=%d, 全图 MSE=%.5f, PSNR=%.1f dB, SSIM=%.4f\n",
            (int)splats.size(), mse, psnr, ssim);
+
+    // ---------- GPU 前向 tile 渲染基准（--gpu）----------
+    if (gpu) {
+        printf("\n---- GPU 前向 tile 渲染基准（--gpu）----\n");
+        GpuForwardTest();
+    }
 
     // ---------- 输出：3DGS 标准前向渲染（参数纹理 + tile 分块剔除）----------
     //

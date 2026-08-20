@@ -3,9 +3,9 @@
 // 与 playpiano_gl 底层同架构：每个 splat 渲染为一个实例化四边形
 //   [顶点着色器] 按 gl_InstanceID 从参数纹理取 SA/SB/SC，计算 3σ 包围盒
 //                四边形角点（旋转椭圆外接），展开为 2 个三角形
-//   [片元着色器] 只对四边形内像素算高斯 g，输出 (颜色, 不透明度*a*g)
-//   [混合]       GL_SRC_ALPHA / GL_ONE_MINUS_SRC_ALPHA 标准 alpha 合成，
-//                渲染顺序 = 实例顺序 = 训练时的合成顺序，逐项复现
+//   [片元着色器] 只对四边形内像素算高斯 g，输出 (颜色*不透明度, 不透明度)
+//   [混合]       GL_ONE / GL_ONE 加和模型（image-gs / playpiano 风格），
+//                顺序无关，无需反转 splat 顺序
 //   [硬件]       光栅化自动剔除无关像素 —— O(覆盖面积) 而非 O(像素*splat数)
 //
 // 数据：加载与 input.glsl 同目录的 input_splatA/B/C.raw（RGBA32F，宽=NS 高=1）
@@ -41,6 +41,7 @@ static std::vector<unsigned> g_resVals;   // 残差修正层 kRes（供 ExportAl
 static float g_zoom = 1.0f;               // 区域放大镜：放大倍数（1=关闭；N>1 只渲染画布 1/N 区域，任意倍数不受屏幕限制）
 static float g_camX = 0.f, g_camY = 0.f;  // 区域放大镜：区域中心（画布坐标，像素）
 static double g_scrollY = 0.0;            // 滚轮缩放累计（回调累加，帧内消费）
+static int g_model = 0;                   // 渲染模型：0=alpha 合成（旧文件默认），1=加和（GLSL 头 MODEL=additive 时切换）
 
 // ---- 工具 ----
 static std::string ExeDir()
@@ -79,6 +80,18 @@ static bool ParseImgSize(const std::string& glsl, float& w, float& h)
         return v > 0.f;
     };
     return findFloat("IMG_W", w) && findFloat("IMG_H", h);
+}
+
+// 解析 GLSL 文件头的 "// MODEL=additive" 标识：
+//   additive -> 加和模型（GL_ONE/GL_ONE 直接累加，顺序无关）
+//   alpha    -> alpha 合成（SRC_ALPHA/ONE_MINUS_SRC_ALPHA，需反转 splat 顺序）
+//   缺省     -> 兼容旧版文件，按 alpha 合成处理
+static int ParseModel(const std::string& glsl)
+{
+    size_t p = glsl.find("MODEL=");
+    if (p == std::string::npos) return 0;   // 旧文件无标识：alpha 合成
+    p += 6;
+    return glsl.compare(p, 8, "additive") == 0 ? 1 : 0;
 }
 
 // 从无纹理纯 GLSL（--embed）解析 const vec4 kName[N] = vec4[N](vec4(f,f,f,f), ...);
@@ -218,16 +231,20 @@ void main(){
 }
 )";
 
-// splat 片元：四边形内算高斯，输出 premultiplied 颜色 + 不透明度
+// splat 片元：四边形内算高斯
+//   uModel=1（加和）：输出 premultiplied（RGB×不透明度），混合 GL_ONE/GL_ONE 直接累加，顺序无关
+//   uModel=0（alpha）：输出 (颜色, 不透明度)，混合 SRC_ALPHA/ONE_MINUS_SRC_ALPHA，依赖实例顺序
 static const char* kFSSplat = R"(
 out vec4 FragColor;
+uniform int uModel;
 in vec2 vMu; in vec2 vSC; in vec2 vS; in vec3 vCol; in float vA;
 void main(){
     vec2 d = fragQ() - vMu;
     float ex = (vSC.x*d.x + vSC.y*d.y) / vS.x;
     float ey = (-vSC.y*d.x + vSC.x*d.y) / vS.y;
     float g = exp(-0.5*(ex*ex + ey*ey));
-    FragColor = vec4(vCol, vA * g);   // 标准 alpha 合成（SRC_ALPHA / ONE_MINUS_SRC_ALPHA）
+    if (uModel == 1) FragColor = vec4(vCol * (vA * g), vA * g);   // 加和：RGB 直接累加
+    else             FragColor = vec4(vCol, vA * g);              // alpha 合成
 }
 )";
 
@@ -345,7 +362,7 @@ static void CreateTargets(int w, int h)
     fbW = w; fbH = h;
     glGenTextures(1, &tA);
     glBindTexture(GL_TEXTURE_2D, tA);
-    // RGBA32F 全精度缓存：splat 叠加的 alpha 合成中间值在半精度（16F）下
+    // RGBA32F 全精度缓存：splat 加和累加中间值在半精度（16F）下
     // 会累积量化误差（实测 PSNR 损失 ~1.9dB），用 32F 保持与训练一致的精度
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, w, h, 0, GL_RGBA, GL_FLOAT, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -605,6 +622,8 @@ int main(int argc, char** argv)
     if (!ParseImgSize(glsl, g_imgW, g_imgH)) {
         printf("input.glsl 中未找到 IMG_W/IMG_H 常量\n"); return 1;
     }
+    g_model = ParseModel(glsl);
+    printf("渲染模型: %s\n", g_model == 1 ? "加和（GL_ONE/GL_ONE，顺序无关）" : "alpha 合成（SRC_ALPHA/ONE_MINUS，需反转顺序）");
     // 区域放大镜初始状态：倍数来自 --zoom，中心默认画布中心（--zoom-x/-y 可指定）
     g_zoom = zoomArg;
     g_camX = zoomX >= 0.f ? zoomX : g_imgW * 0.5f;
@@ -677,19 +696,21 @@ int main(int argc, char** argv)
     if (NS == 0 || rawB.size() != rawA.size() || rawC.size() != rawA.size()) {
         printf("splat 数据尺寸不一致\n"); return 1;
     }
-    // 注意合成顺序：训练是"从前往后"（splat 0 在最前），而 GL 的
-    // SRC_ALPHA/ONE_MINUS_SRC_ALPHA 混合是"从后往前"（先画的在最底层），
-    // 因此上传纹理时把 splat 顺序反转，使 GL 先画训练列表里最靠后的 splat。
+    // 渲染顺序：
+    //   加和模型顺序无关：按训练列表原序上传（GL_ONE/GL_ONE 直接累加）
+    //   alpha 合成依赖顺序：训练是"从前往后"（splat 0 在最前），而 GL 的
+    //     SRC_ALPHA/ONE_MINUS_SRC_ALPHA 混合是"从后往前"（先画的在最底层），
+    //     因此上传纹理时把 splat 顺序反转，使 GL 先画训练列表里最靠后的 splat。
     std::vector<float> spl(NS * 3 * 4);
     for (size_t i = 0; i < NS; ++i) {
         const float* pA = (const float*)rawA.data() + i * 4;
         const float* pB = (const float*)rawB.data() + i * 4;
         const float* pC = (const float*)rawC.data() + i * 4;
-        size_t r = NS - 1 - i;                       // 反转后的实例列（先画最底层）
-        float* base = spl.data() + r * 4;            // 纹理 NS 宽 x 3 高，行主序
-        memcpy(base + 0 * NS * 4, pA, 16);           // row0 = SA
-        memcpy(base + 1 * NS * 4, pB, 16);           // row1 = SB
-        memcpy(base + 2 * NS * 4, pC, 16);           // row2 = SC
+        size_t r = (g_model == 1) ? i : NS - 1 - i;    // 加和=原序；alpha=反转
+        float* base = spl.data() + r * 4;              // 纹理 NS 宽 x 3 高，行主序
+        memcpy(base + 0 * NS * 4, pA, 16);             // row0 = SA
+        memcpy(base + 1 * NS * 4, pB, 16);             // row1 = SB
+        memcpy(base + 2 * NS * 4, pC, 16);             // row2 = SC
     }
     printf("splats: %d\n", (int)NS);
 
@@ -753,6 +774,7 @@ int main(int argc, char** argv)
     if (!pSplat.id || !pPresent.id) return 1;
     GLint uBaseLoc = glGetUniformLocation(pSplat.id, "uBase");     // 动画增量：实例偏移
     GLint uScaleLoc = glGetUniformLocation(pSplat.id, "uScale");   // 高清直渲：坐标放大系数
+    GLint uModelLoc = glGetUniformLocation(pSplat.id, "uModel");   // 渲染模型：1=加和，0=alpha 合成
 
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
@@ -772,16 +794,21 @@ int main(int argc, char** argv)
     double lastMX = 0, lastMY = 0;  // 区域放大镜：上一帧鼠标位置
     glfwGetCursorPos(win, &lastMX, &lastMY);
 
-    // 增量绘制 [base, base+cnt) 段。over 算子满足结合律：段内顺序保持，段间在
-    // 持久 FBO 上叠加（RGBA32F 全精度）≡ 一次性按序全量渲染。动画每帧只画新增段，
-    // 渲染开销恒定 O(animRate)，不会随累计量增长（重绘方案是 ΣN ≈ N²/2 的二次方）。
+    // 增量绘制 [base, base+cnt) 段。
+    //   加和模型满足结合律与交换律：段内/段间顺序无关，持久 FBO 上 GL_ONE/GL_ONE 累加
+    //     （RGBA32F 全精度）≡ 一次性全量渲染。
+    //   alpha 合成依赖顺序：GL 混合天然"从后往前"（先画的在最底层），上传时已反转，
+    //     静态全量绘制顺序 = 训练顺序；动画模式的增量段为娱乐效果（渐进浮现），与静态略有差异。
+    // 动画每帧只画新增段，渲染开销恒定 O(animRate)，不会随累计量增长（重绘方案是 ΣN ≈ N²/2 的二次方）。
     auto DrawSeg = [&](int base, int cnt, bool doClear) {
         glViewport(0, 0, rW, rH);
         glBindFramebuffer(GL_FRAMEBUFFER, fboA);
         if (doClear) { glClearColor(0.f, 0.f, 0.f, 0.f); glClear(GL_COLOR_BUFFER_BIT); }
         glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        if (g_model == 1) glBlendFunc(GL_ONE, GL_ONE);                    // 加和：直接累加，顺序无关
+        else              glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);  // alpha 合成
         glUseProgram(pSplat.id);
+        glUniform1i(uModelLoc, g_model);
         glUniform2f(pSplat.res, (float)rW, (float)rH);
         // 区域放大镜：只渲染画布上 (g_camX,g_camY) 为中心、1/g_zoom 大小的区域，
         // 以 scale*zoom 倍密度栅格化——对连续高斯函数的高密度采样，放大不受屏幕尺寸限制。

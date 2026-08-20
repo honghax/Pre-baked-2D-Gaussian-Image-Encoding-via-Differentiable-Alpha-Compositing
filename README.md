@@ -1,4 +1,4 @@
-# Pre-baked 2D Gaussian Image Encoding via Differentiable Alpha Compositing
+# Pre-baked 2D Gaussian Image Encoding via Differentiable Rendering (Additive / Alpha Compositing)
 
 ## Abstract
 
@@ -7,7 +7,9 @@
 ## How it works
 
 - **Primitives**: anisotropic 2D Gaussian kernels, each defined by position `(mx, my)`, axis lengths `(sx, sy)`, orientation `rot`, color `(r, g, b)`, and opacity `a`.
-- **Rendering**: per-pixel alpha compositing (ordered front-to-back blending) `acc += c * α * T; T *= (1 - α)`, operating entirely in screen space — no camera model, depth, or multi-view data.
+- **Rendering** — two interchangeable models, selected at training time via `--model` and baked into the GLSL header as a `MODEL=` tag that the renderer auto-detects:
+  - **`--model 1` additive (default, image-gs / playpiano style)**: each splat contributes `acc += c * α` with no transmittance chain — order-independent, so the backward pass is per-splat independent and the renderer simply accumulates with `GL_ONE / GL_ONE`.
+  - **`--model 0` alpha compositing (classic 3DGS)**: ordered front-to-back blending `acc += c * α * T; T *= (1 - α)`, order-dependent (the renderer reverses splat order and blends with `GL_SRC_ALPHA / GL_ONE_MINUS_SRC_ALPHA`).
 - **Optimization**: L1 + SSIM reconstruction loss, Adam with learning-rate decay, tile-based culling, stochastic sampling, and periodic density control (splitting under-fit splats, pruning low-opacity ones).
 - **Export**: parameters are quantized into compact `uint` arrays embedded in a single self-contained GLSL file (or raw texture lookups), with an optional **residual correction layer** that stores the quantized per-pixel difference between target and Gaussian render, recovering high-frequency detail.
 
@@ -78,6 +80,7 @@ fitsplat input.png --splats 350000 --iters 15000 --width 800 --embed 1 --out out
 | `--out FILE` | fitsplat.glsl | output GLSL path |
 | `--embed N` | 0 | `1` = quantize params into `uint` arrays embedded in one self-contained GLSL (no runtime texture files); `0` = texture-based raw output |
 | `--residual N` | 0 | `1` = append residual correction layer (4-bit/channel, ±64) to the embedded GLSL — recovers high-frequency detail, typically **+9 dB PSNR** at +2% size |
+| `--model N` | 1 | render model: `1` = additive (order-independent, default), `0` = alpha compositing (classic 3DGS) |
 | `--l1only N` | 0 | `1` = use L1 loss only (default is L1 + SSIM) |
 | `--l2 N` | 0 | `1` = use L2 loss |
 | `--ckpt FILE` | — | save a checkpoint every `--ckpt-every` iterations |
@@ -90,6 +93,8 @@ Example (embed + residual, as shown in the figures below):
 ```powershell
 fitsplat input.png --splats 350000 --iters 15000 --width 800 --embed 1 --residual 1 --out input.glsl
 ```
+
+The exported GLSL begins with a model tag — `// MODEL=additive` or `// MODEL=alpha` — that the renderer parses to select the matching blend mode automatically.
 
 ### 2. Render — `fitsplat_gl`
 
@@ -121,6 +126,8 @@ The animation renders the first *N* splats each beat (N = beat count × rate) in
 
 The renderer acts as a **decoder**: it parses the embedded `uint` arrays from the GLSL on the CPU (~74 ms for 1M splats), uploads them as parameter textures, and runs a small shader for per-splat instanced quads — avoiding GPU driver compilation of a multi-hundred-MB constant array.
 
+It also parses the `MODEL=` tag from the GLSL header and renders accordingly: `additive` → splats uploaded in training order with `GL_ONE / GL_ONE` accumulation (order-independent); `alpha` → splats reversed and blended with `GL_SRC_ALPHA / GL_ONE_MINUS_SRC_ALPHA`. Files without the tag (pre-dual-mode exports) fall back to alpha compositing.
+
 ## Results
 
 800×1165 canvas, 1,017,194 splats, 15k iterations (quantized embedded export).
@@ -136,9 +143,10 @@ The residual correction layer stores `target − gaussian_render` quantized to 4
 
 `--embed 1` produces a single self-contained GLSL file containing:
 
+- `// MODEL=...` — header tag identifying the training model (`additive` or `alpha`); `fitsplat_gl` uses it to pick the blend mode automatically
 - `kMXS`/`kMYS` — adaptive position quantization scale (avoids 16-bit overflow on large canvases)
 - `kData[]` — quantized splat parameters (position, size, rotation, color, opacity)
 - `kRes[]` — optional residual layer (`--residual 1`)
-- `sampleImage()` — the full alpha-compositing render function
+- `sampleImage()` — the render function, generated to match the selected model (additive accumulation or alpha compositing)
 
 This file is portable: copy it next to any `fitsplat_gl` binary and it will render without any external data.

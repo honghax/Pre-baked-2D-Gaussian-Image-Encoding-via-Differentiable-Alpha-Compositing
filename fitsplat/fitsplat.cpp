@@ -1,17 +1,23 @@
 // fitsplat.cpp — 把一张图片拟合成"高斯泼溅参数 + 渲染算法"（离线优化，允许高耗时）
 //
-// 遵循业界主流 3D Gaussian Splatting 做法：
-//   1) 可微渲染：每个 splat 是不透明度 α=a*gauss（位置/尺寸/旋转参数化的 2D 高斯），
-//      按固定顺序做 alpha 合成  acc += c*α*T, T *= (1-α)，输出天然 ≤1，数值稳定。
-//   2) 梯度优化：L1 损失 + 解析反传（标准 alpha 合成 backward 递推）+ Adam，
+// 支持两种渲染模型（--model 0|1，默认 1）：
+//   model 1 = 加和模型（image-gs / playpiano 风格）：
+//       每个 splat 是 2D 高斯（位置/尺寸/旋转参数化），权重 w = a*gauss，
+//       逐 splat 加和  acc += c*w，顺序无关、无 transmittance 链，输出最后 clamp ≤1。
+//   model 0 = alpha 合成（3DGS 标准，旧版 fitsplat_git 行为）：
+//       逐 splat 按序合成  acc += c*w*T; T *= (1-w)，依赖渲染顺序。
+//   梯度优化：L1 损失 + 解析反传（加和 backward 逐 splat 独立；alpha 需要 T 递推）+ Adam，
 //      学习率随迭代衰减，单步幅值 clamp 防发散。
-//   3) 密度控制：累积位置梯度分裂"欠拟合" splat，删除低不透明度 splat。
+//   密度控制：累积位置梯度分裂"欠拟合" splat，删除低权重 splat；
+//      渐进模式（--prog）额外按误差采样补残差 splat（image-gs 风格）。
 //
-// 产物是一小段 GLSL（const 数组参数 + 十几行 alpha 合成渲染），运行时实时合成图像。
+// 产物是一小段 GLSL（const 数组参数 + 十几行渲染），文件头带 MODEL 标识，
+// 运行时由 fitsplat_gl 按标识自动选择混合方式渲染。
 //
 // 用法：
 //   fitsplat input.png [--splats 600] [--iters 1000] [--width 320] [--height 0] [--batch 2048]
 //            [--out out.glsl] [--threads 0] [--bg 0.0] [--seed 42] [--preview 10] [--embed 1]
+//            [--model 0|1]
 //
 // 依赖：stb_image.h（仅读 PNG）
 
@@ -76,6 +82,8 @@ static std::vector<unsigned char> valid;   // W*H，1=有效像素（alpha 不�
 static std::vector<Splat> splats;
 static std::vector<std::array<float, 9>> mAdam, vAdam;
 static std::vector<std::array<float, 2>> gradAcc;   // 密度控制：累积位置梯度
+static float gInitScale = 5.0f;            // 内容自适应初始化/误差引导添加的初始高斯尺度（像素）
+static int   g_model = 1;                  // 渲染模型：0=alpha 合成（3DGS 旧版），1=加和模型（默认）
 
 static inline void SplatFromParams(Splat& s, const std::array<float, 9>& p) {
     s.mx  = p[0]; s.my = p[1];
@@ -88,94 +96,162 @@ static inline void SplatFromParams(Splat& s, const std::array<float, 9>& p) {
     s.cs = cosf(s.rot); s.sn = sinf(s.rot);
 }
 
-// 单像素 alpha 合成渲染（tile 局部版；与最终 GLSL 一致；输出 clamp 到 [0,1]）
+// 单像素渲染（tile 局部版；与最终 GLSL 一致；输出 clamp 到 [0,1]）
+// model 1=加和（顺序无关）；model 0=alpha 合成（依赖 idx 顺序，T 递推）
 static inline void RenderPixel(const Splat* S, const uint32_t* idx, int n, float x, float y, float& r, float& g, float& b) {
-    float T = 1.0f; r = g = b = 0.0f;
-    for (int k = 0; k < n; ++k) {
-        const Splat& s = S[idx[k]];
-        float dx = x - s.mx, dy = y - s.my;
-        if (dx * dx + dy * dy > s.r2) continue;          // 快速剔除
-        float ex = (s.cs * dx + s.sn * dy) / s.sx;
-        float ey = (-s.sn * dx + s.cs * dy) / s.sy;
-        float gv = expf(-0.5f * (ex * ex + ey * ey));
-        float alpha = s.a * gv;
-        r += s.r * alpha * T; g += s.g * alpha * T; b += s.b * alpha * T;
-        T *= 1.0f - alpha;
+    r = g = b = 0.0f;
+    if (g_model == 1) {
+        for (int k = 0; k < n; ++k) {
+            const Splat& s = S[idx[k]];
+            float dx = x - s.mx, dy = y - s.my;
+            if (dx * dx + dy * dy > s.r2) continue;          // 快速剔除
+            float ex = (s.cs * dx + s.sn * dy) / s.sx;
+            float ey = (-s.sn * dx + s.cs * dy) / s.sy;
+            float gv = expf(-0.5f * (ex * ex + ey * ey));
+            float w = s.a * gv;
+            r += s.r * w; g += s.g * w; b += s.b * w;        // 加和：顺序无关，无 transmittance
+        }
+    } else {
+        float T = 1.0f;
+        for (int k = 0; k < n; ++k) {
+            const Splat& s = S[idx[k]];
+            float dx = x - s.mx, dy = y - s.my;
+            if (dx * dx + dy * dy > s.r2) continue;          // 快速剔除
+            float ex = (s.cs * dx + s.sn * dy) / s.sx;
+            float ey = (-s.sn * dx + s.cs * dy) / s.sy;
+            float gv = expf(-0.5f * (ex * ex + ey * ey));
+            float alpha = s.a * gv;
+            r += s.r * alpha * T; g += s.g * alpha * T; b += s.b * alpha * T;
+            T *= 1.0f - alpha;
+        }
     }
     r = ClampF(r, 0, 1); g = ClampF(g, 0, 1); b = ClampF(b, 0, 1);
 }
 
-// ---------- 可微渲染：正传 + 反传（3DGS 标准 alpha 合成 backward 递推）----------
+// ---------- 可微渲染：正传 + 反传（加和 backward 逐 splat 独立 / alpha 需要 T 递推）----------
 struct PixelFwd2 {
-    std::vector<float> alpha, T, g, ex, ey;
+    std::vector<float> alpha, T, g, ex, ey;   // T 仅 alpha 模式使用（加和模式恒为 1.0）
     void resize(size_t K) { alpha.resize(K); T.resize(K); g.resize(K); ex.resize(K); ey.resize(K); }
 };
 
 // 正传（tile 局部版）：只遍历本像素所在 tile 的 splat（idx 为全局索引列表，n 为个数）
 static inline void ForwardPixel2(const Splat* S, const uint32_t* idx, int n, float x, float y, PixelFwd2& fwd, float& accR, float& accG, float& accB) {
-    float T = 1.0f; accR = accG = accB = 0.0f;
+    accR = accG = accB = 0.0f;
     fwd.resize((size_t)n);
-    for (int k = 0; k < n; ++k) {
-        const Splat& s = S[idx[k]];
-        float dx = x - s.mx, dy = y - s.my;
-        float gv = 0.0f, ex = 0.0f, ey = 0.0f;
-        if (dx * dx + dy * dy <= s.r2) {
-            ex = (s.cs * dx + s.sn * dy) / s.sx;
-            ey = (-s.sn * dx + s.cs * dy) / s.sy;
-            gv = expf(-0.5f * (ex * ex + ey * ey));
+    if (g_model == 1) {
+        for (int k = 0; k < n; ++k) {
+            const Splat& s = S[idx[k]];
+            float dx = x - s.mx, dy = y - s.my;
+            float gv = 0.0f, ex = 0.0f, ey = 0.0f;
+            if (dx * dx + dy * dy <= s.r2) {
+                ex = (s.cs * dx + s.sn * dy) / s.sx;
+                ey = (-s.sn * dx + s.cs * dy) / s.sy;
+                gv = expf(-0.5f * (ex * ex + ey * ey));
+            }
+            float alpha = s.a * gv;
+            fwd.g[k] = gv; fwd.ex[k] = ex; fwd.ey[k] = ey;
+            fwd.alpha[k] = alpha; fwd.T[k] = 1.0f;
+            accR += s.r * alpha; accG += s.g * alpha; accB += s.b * alpha;   // 加和：不乘 T
         }
-        float alpha = s.a * gv;
-        fwd.g[k] = gv; fwd.ex[k] = ex; fwd.ey[k] = ey;
-        fwd.alpha[k] = alpha; fwd.T[k] = T;
-        accR += s.r * alpha * T; accG += s.g * alpha * T; accB += s.b * alpha * T;
-        T *= 1.0f - alpha;
+    } else {
+        float T = 1.0f;
+        for (int k = 0; k < n; ++k) {
+            const Splat& s = S[idx[k]];
+            float dx = x - s.mx, dy = y - s.my;
+            float gv = 0.0f, ex = 0.0f, ey = 0.0f;
+            if (dx * dx + dy * dy <= s.r2) {
+                ex = (s.cs * dx + s.sn * dy) / s.sx;
+                ey = (-s.sn * dx + s.cs * dy) / s.sy;
+                gv = expf(-0.5f * (ex * ex + ey * ey));
+            }
+            float alpha = s.a * gv;
+            fwd.g[k] = gv; fwd.ex[k] = ex; fwd.ey[k] = ey;
+            fwd.alpha[k] = alpha; fwd.T[k] = T;
+            accR += s.r * alpha * T; accG += s.g * alpha * T; accB += s.b * alpha * T;
+            T *= 1.0f - alpha;
+        }
     }
 }
 
 // 反传（tile 局部版）：对局部列表里的每个 splat 累加 9 参数梯度到全局 gacc[idx[ii]]
 // touched/mark：记录本迭代被触碰的 splat（稀疏梯度：Adam 更新只处理触碰集，
 // 消除每迭代 tGrads 全量清零 + 全量交叉读取两大内存带宽开销）
+// 加和模型：∂L/∂α_i = eC（无 transmittance 递推），各 splat 梯度完全独立
+// alpha 模型：∂L/∂α_i = eC*T_i - gradT*T_i，逆序递推 gradT
 static inline void BackwardPixel2(const Splat* S, const uint32_t* idx, int n, const PixelFwd2& fwd,
                                   float eR, float eG, float eB,
                                   std::vector<std::array<float, 9>>& gacc,
                                   std::vector<uint32_t>& touched, std::vector<unsigned char>& mark) {
-    float gradT = 0.0f;   // ∂L/∂T_{i+1}
-    for (int ii = n - 1; ii >= 0; --ii) {
-        size_t gi = idx[ii];                          // 全局 splat 索引
-        if (!mark[gi]) { mark[gi] = 1; touched.push_back((uint32_t)gi); }   // 稀疏梯度：首次触碰才入列表
-        const Splat& s = S[gi];
-        float T_i = fwd.T[ii];
-        float alp = fwd.alpha[ii];
-        float gv  = fwd.g[ii];
-        // E·c_i = Σ_c e_c * c_{i,c}（e_c 由 L1/L2 损失的 ∂L/∂acc_c 决定）
-        float eC = eR * s.r + eG * s.g + eB * s.b;
-        float dAlp = eC * T_i - gradT * T_i;          // ∂L/∂α_i
-        float dTi  = eC * alp + gradT * (1.0f - alp); // ∂L/∂T_i
-        gradT = dTi;
+    if (g_model == 1) {
+        for (int ii = 0; ii < n; ++ii) {
+            size_t gi = idx[ii];                          // 全局 splat 索引
+            if (!mark[gi]) { mark[gi] = 1; touched.push_back((uint32_t)gi); }   // 稀疏梯度：首次触碰才入列表
+            const Splat& s = S[gi];
+            float alp = fwd.alpha[ii];
+            float gv  = fwd.g[ii];
+            // E·c_i = Σ_c e_c * c_{i,c}（e_c 由 L1/L2 损失的 ∂L/∂acc_c 决定）
+            float eC = eR * s.r + eG * s.g + eB * s.b;
+            float dAlp = eC;                              // ∂L/∂α_i = Σ_c e_c c_c（加和无 T 耦合）
 
-        std::array<float, 9>& g = gacc[gi];
-        // α = a * gauss
-        float dA = dAlp * gv;                         // ∂L/∂a
-        float dG = dAlp * s.a;                        // ∂L/∂gauss
-        g[8] += dA * s.a * (1.0f - s.a);              // ∂L/∂logit(a)
-        // 颜色：∂L/∂c_c = e_c * α_i * T_i
-        g[5] += eR * alp * T_i; g[6] += eG * alp * T_i; g[7] += eB * alp * T_i;
+            std::array<float, 9>& g = gacc[gi];
+            // α = a * gauss
+            float dA = dAlp * gv;                         // ∂L/∂a
+            float dG = dAlp * s.a;                        // ∂L/∂gauss
+            g[8] += dA * s.a * (1.0f - s.a);              // ∂L/∂logit(a)
+            // 颜色：∂L/∂c_c = e_c * α_i
+            g[5] += eR * alp; g[6] += eG * alp; g[7] += eB * alp;
 
-        float w = dG * gv;
-        if (w == 0.0f) continue;
-        float ex = fwd.ex[ii], ey = fwd.ey[ii];
-        float cs = s.cs, sn = s.sn;
-        // 形状参数梯度：dg/dmx = g*(ex*cs/sx - ey*sn/sy)，∂L/∂p = w * (dg/dp 去除 g)
-        g[0] += w * (ex * cs / s.sx - ey * sn / s.sy);   // ∂L/∂mx
-        g[1] += w * (ex * sn / s.sx + ey * cs / s.sy);   // ∂L/∂my
-        g[2] += w * (ex * ex);                           // ∂L/∂log(sx)
-        g[3] += w * (ey * ey);                           // ∂L/∂log(sy)
-        // d(dex)/drot 的分子需要像素-中心差值 dx,dy：由 ex/ey 反解
-        float dxp = cs * (ex * s.sx) - sn * (ey * s.sy);
-        float dyp = sn * (ex * s.sx) + cs * (ey * s.sy);
-        float u1r = -sn * dxp + cs * dyp;
-        float v1r = -cs * dxp - sn * dyp;
-        g[4] += w * (-ex * u1r / s.sx - ey * v1r / s.sy); // ∂L/∂rot
+            float w = dG * gv;
+            if (w == 0.0f) continue;
+            float ex = fwd.ex[ii], ey = fwd.ey[ii];
+            float cs = s.cs, sn = s.sn;
+            // 形状参数梯度：dg/dmx = g*(ex*cs/sx - ey*sn/sy)，∂L/∂p = w * (dg/dp 去除 g)
+            g[0] += w * (ex * cs / s.sx - ey * sn / s.sy);   // ∂L/∂mx
+            g[1] += w * (ex * sn / s.sx + ey * cs / s.sy);   // ∂L/∂my
+            g[2] += w * (ex * ex);                           // ∂L/∂log(sx)
+            g[3] += w * (ey * ey);                           // ∂L/∂log(sy)
+            // d(dex)/drot 的分子需要像素-中心差值 dx,dy：由 ex/ey 反解
+            float dxp = cs * (ex * s.sx) - sn * (ey * s.sy);
+            float dyp = sn * (ex * s.sx) + cs * (ey * s.sy);
+            float u1r = -sn * dxp + cs * dyp;
+            float v1r = -cs * dxp - sn * dyp;
+            g[4] += w * (-ex * u1r / s.sx - ey * v1r / s.sy); // ∂L/∂rot
+        }
+    } else {
+        float gradT = 0.0f;   // ∂L/∂T_{i+1}（alpha 合成逆序递推）
+        for (int ii = n - 1; ii >= 0; --ii) {
+            size_t gi = idx[ii];                          // 全局 splat 索引
+            if (!mark[gi]) { mark[gi] = 1; touched.push_back((uint32_t)gi); }   // 稀疏梯度：首次触碰才入列表
+            const Splat& s = S[gi];
+            float T_i = fwd.T[ii];
+            float alp = fwd.alpha[ii];
+            float gv  = fwd.g[ii];
+            float eC = eR * s.r + eG * s.g + eB * s.b;
+            float dAlp = eC * T_i - gradT * T_i;          // ∂L/∂α_i
+            float dTi  = eC * alp + gradT * (1.0f - alp); // ∂L/∂T_i
+            gradT = dTi;
+
+            std::array<float, 9>& g = gacc[gi];
+            float dA = dAlp * gv;                         // ∂L/∂a
+            float dG = dAlp * s.a;                        // ∂L/∂gauss
+            g[8] += dA * s.a * (1.0f - s.a);              // ∂L/∂logit(a)
+            // 颜色：∂L/∂c_c = e_c * α_i * T_i
+            g[5] += eR * alp * T_i; g[6] += eG * alp * T_i; g[7] += eB * alp * T_i;
+
+            float w = dG * gv;
+            if (w == 0.0f) continue;
+            float ex = fwd.ex[ii], ey = fwd.ey[ii];
+            float cs = s.cs, sn = s.sn;
+            g[0] += w * (ex * cs / s.sx - ey * sn / s.sy);   // ∂L/∂mx
+            g[1] += w * (ex * sn / s.sx + ey * cs / s.sy);   // ∂L/∂my
+            g[2] += w * (ex * ex);                           // ∂L/∂log(sx)
+            g[3] += w * (ey * ey);                           // ∂L/∂log(sy)
+            float dxp = cs * (ex * s.sx) - sn * (ey * s.sy);
+            float dyp = sn * (ex * s.sx) + cs * (ey * s.sy);
+            float u1r = -sn * dxp + cs * dyp;
+            float v1r = -cs * dxp - sn * dyp;
+            g[4] += w * (-ex * u1r / s.sx - ey * v1r / s.sy); // ∂L/∂rot
+        }
     }
 }
 
@@ -323,8 +399,62 @@ static float EvaluateSSIM(int nSamples = 512) {
     return total / nSamples;
 }
 
+// ---------- 内容自适应初始化：梯度引导采样（image-gs 风格） ----------
+// 按图像梯度幅值² 的概率采样像素作为 splat 中心，细节区集中分配、平滑区少分配；
+// 30% 均匀随机兜底平滑区。颜色直接用目标色（color init，与网格初始化一致）。
+static void InitSplatGradient(int K, std::mt19937& rng) {
+    std::vector<float> grad((size_t)W * H, 0.0f);
+    double gsum = 0;
+    for (int j = 0; j < H; ++j) {
+        for (int i = 0; i < W; ++i) {
+            if (!valid[(size_t)j * W + i]) continue;
+            int i0 = std::max(i - 1, 0), i1 = std::min(i + 1, W - 1);
+            int j0 = std::max(j - 1, 0), j1 = std::min(j + 1, H - 1);
+            float gx = 0, gy = 0;
+            for (int c = 0; c < 3; ++c) {
+                gx += fabsf(target[((size_t)j * W + i1) * 3 + c] - target[((size_t)j * W + i0) * 3 + c]);
+                gy += fabsf(target[((size_t)j1 * W + i) * 3 + c] - target[((size_t)j0 * W + i) * 3 + c]);
+            }
+            float g = gx + gy;
+            grad[(size_t)j * W + i] = g * g;
+            gsum += (double)g * g;
+        }
+    }
+    if (gsum <= 0) gsum = 1.0;
+    std::vector<double> cdf((size_t)W * H + 1, 0.0);
+    for (size_t i = 0; i < grad.size(); ++i) cdf[i + 1] = cdf[i] + (double)grad[i] / gsum;
+    std::uniform_real_distribution<double> u01(0.0, 1.0);
+    std::uniform_int_distribution<int> upix(0, W * H - 1);
+    for (int k = 0; k < K; ++k) {
+        size_t pi;
+        float ps;
+        if (k % 10 < 3) { pi = (size_t)upix(rng); ps = gInitScale * 2.5f; }   // 30% 随机：大尺度兜底平滑区
+        else {                                                               // 70% 按梯度概率采样：细节区小尺度
+            double u = u01(rng);
+            auto it = std::upper_bound(cdf.begin(), cdf.end(), u);
+            pi = (size_t)(it - cdf.begin()) - 1;
+            ps = gInitScale;
+        }
+        if (!valid[pi]) continue;                                // 透明像素跳过
+        Splat s;
+        s.mx = (float)(pi % W) + 0.5f; s.my = (float)(pi / W) + 0.5f;
+        s.sx = ps; s.sy = ps; s.rot = 0.0f;
+        s.r = ClampF(target[pi * 3], 0, 1); s.g = ClampF(target[pi * 3 + 1], 0, 1); s.b = ClampF(target[pi * 3 + 2], 0, 1);
+        s.a = 0.5f;
+        s.r2 = (3.0f * s.sx) * (3.0f * s.sx);
+        s.cs = 1.0f; s.sn = 0.0f;
+        splats.push_back(s);
+        mAdam.push_back(std::array<float, 9>{});
+        vAdam.push_back(std::array<float, 9>{});
+        gradAcc.push_back(std::array<float, 2>{});
+    }
+}
+
 // ---------- 密度控制：分裂高梯度 splat，删除低不透明度 splat ----------
-static void Densify(size_t maxK, std::mt19937& rng) {
+// errAdd=1 时（渐进模式）额外做误差引导添加：全图渲染后在"欠拟合区"（渲染<目标）
+// 采样新 splat，颜色=正残差（加和模型下 splat 颜色仍 clamp 到 [0,1]，只能补亮缺口；
+// 若未来放开颜色负值约束可直接用 image-gs 的 diff_map 双向残差），位置=误差像素。
+static void Densify(size_t maxK, std::mt19937& rng, bool errAdd) {
     if (splats.empty()) return;
     size_t K = splats.size();
     std::vector<size_t> byA(K), byG(K);
@@ -357,6 +487,46 @@ static void Densify(size_t maxK, std::mt19937& rng) {
             addM.push_back(std::array<float, 9>{});
             addV.push_back(std::array<float, 9>{});
             addGA.push_back(std::array<float, 2>{});
+        }
+    }
+    // 误差引导添加（渐进模式）：补足到 maxK 的缺口，残差色初始化
+    if (errAdd) {
+        size_t finalCnt = K - nDrop + add.size();
+        if (finalCnt < maxK) {
+            std::vector<float> render;
+            Evaluate(&render);   // 全图渲染（复用评估渲染）
+            std::vector<double> prob((size_t)W * H, 0.0);
+            double psum = 0;
+            for (size_t i = 0; i < (size_t)W * H; ++i) {
+                if (!valid[i]) continue;
+                float d = (target[i * 3] - render[i * 3]) + (target[i * 3 + 1] - render[i * 3 + 1]) + (target[i * 3 + 2] - render[i * 3 + 2]);
+                if (d > 0) { prob[i] = (double)(d * d); psum += prob[i]; }
+            }
+            size_t want = maxK - finalCnt;
+            if (psum > 1e-12) {
+                std::vector<double> cdf(prob.size() + 1, 0.0);
+                for (size_t i = 0; i < prob.size(); ++i) cdf[i + 1] = cdf[i] + prob[i] / psum;
+                std::uniform_real_distribution<double> u01(0.0, 1.0);
+                for (size_t w = 0; w < want; ++w) {
+                    double u = u01(rng);
+                    auto it = std::upper_bound(cdf.begin(), cdf.end(), u);
+                    size_t pi = (size_t)(it - cdf.begin()) - 1;
+                    if (!valid[pi]) continue;
+                    Splat n;
+                    n.mx = (float)(pi % W) + 0.5f; n.my = (float)(pi / W) + 0.5f;
+                    n.sx = gInitScale * 0.6f; n.sy = gInitScale * 0.6f; n.rot = 0.0f;   // 细节补丁：小尺度高浓度
+                    n.r = ClampF(target[pi * 3] - render[pi * 3], 0, 1);
+                    n.g = ClampF(target[pi * 3 + 1] - render[pi * 3 + 1], 0, 1);
+                    n.b = ClampF(target[pi * 3 + 2] - render[pi * 3 + 2], 0, 1);
+                    n.a = 0.6f;
+                    n.r2 = (3.0f * n.sx) * (3.0f * n.sx);
+                    n.cs = 1.0f; n.sn = 0.0f;
+                    add.push_back(n);
+                    addM.push_back(std::array<float, 9>{});
+                    addV.push_back(std::array<float, 9>{});
+                    addGA.push_back(std::array<float, 2>{});
+                }
+            }
         }
     }
     std::vector<Splat> nS; nS.reserve(splats.size() + add.size());
@@ -392,6 +562,10 @@ static void PrintUsage() {
     printf("  --l2 1        像素梯度用 L2(∝误差) 替代 L1 次梯度(±1)，高精度收敛更干净（默认 0）\n");
     printf("  --target F    目标 PSNR(dB)，每 10%% 迭代全图评估，达到即提前停止（默认 0 = 不启用）\n");
     printf("  --gputrain 1  训练切到 GPU compute shader（正传/反传/Adam 全 GPU，需 OpenGL 4.3；默认 0 = CPU）\n");
+    printf("  --init 1      梯度引导初始化（内容自适应：按图像梯度概率采样，细节区集中分配；默认 0 = 网格）\n");
+    printf("  --prog 1      误差引导渐进优化（初始 50%% splat，逐步在欠拟合区补残差 splat，预算=--splats；默认 0）\n");
+    printf("  --init-scale F 初始/新增高斯尺度（像素，默认 5.0；--init 1 / --prog 1 时生效）\n");
+    printf("  --model 0|1    渲染模型：1=加和（image-gs 风格，默认），0=alpha 合成（3DGS 旧版）\n");
 }
 
 static double NowSec() {
@@ -402,7 +576,7 @@ static double NowSec() {
 // ---------- GPU 前向 tile 渲染基准（--gpu）----------
 // 验证思路（只移植最容易验证的前向）：
 //   CPU：BuildTileMap 构建 tile → splat 索引表
-//   GPU：每个 workgroup 渲染一个 16x16 tile，逐像素按列表顺序 alpha 合成
+//   GPU：每个 workgroup 渲染一个 16x16 tile，逐像素按列表顺序加和（无 transmittance）
 //   CPU：读回结果，与 CPU Evaluate 全量渲染对比（数值一致性 + 耗时加速比）
 static const char* kGpuFwdShader = R"GLSL(
 #version 430 core
@@ -418,6 +592,7 @@ layout(std430, binding = 4) writeonly buffer SImg  { vec4 img[]; };
 uniform uint uTCOLS;
 uniform uint uImgW;
 uniform uint uImgH;
+uniform int  uModel;    // 1=加和（顺序无关），0=alpha 合成（T 递推）
 
 void main() {
     uvec2 px = gl_GlobalInvocationID.xy;
@@ -440,8 +615,12 @@ void main() {
         float ey = (-sb.y * dx + sb.x * dy) / sa.w;
         float gv = exp(-0.5f * (ex * ex + ey * ey));
         float alpha = sc.y * gv;
-        acc += vec3(sb.z, sb.w, sc.x) * (alpha * T);
-        T *= 1.0f - alpha;
+        if (uModel == 1) {
+            acc += vec3(sb.z, sb.w, sc.x) * alpha;       // 加和：顺序无关，无 transmittance
+        } else {
+            acc += vec3(sb.z, sb.w, sc.x) * (alpha * T);
+            T *= 1.0f - alpha;
+        }
     }
     if (px.x < uImgW && px.y < uImgH)
         img[px.y * uImgW + px.x] = vec4(clamp(acc, 0.0f, 1.0f), 1.0f);
@@ -530,6 +709,7 @@ static double GpuForwardTest()
     glUniform1ui(glGetUniformLocation(prog, "uTCOLS"), (GLuint)TCOLS);
     glUniform1ui(glGetUniformLocation(prog, "uImgW"),  (GLuint)W);
     glUniform1ui(glGetUniformLocation(prog, "uImgH"),  (GLuint)H);
+    glUniform1i (glGetUniformLocation(prog, "uModel"), g_model);
 
     // 6) dispatch 计时（5 次取最小，排除首帧驱动编译）
     double gpuBest = 1e18;
@@ -589,8 +769,8 @@ static double GpuForwardTest()
 // ================= GPU 训练（--gputrain）=================
 // 架构：每 workgroup = 1 个 8x8 训练 tile（local 8x8，每线程 1 像素），四个 compute pass：
 //   zero  清零 stat/touchMark/touchCnt（每迭代开头）
-//   fwd   正传：alpha 合成，fwd 数据(alpha,T,ex,ey)写 SSBO，像素颜色写 pcol，原子累加 loss/像素数
-//   bwd   反传：读 fwd/pcol，反向 alpha 合成 backward 递推，原子加 9 参数梯度，稀疏 touch 收集
+//   fwd   正传：加和，fwd 数据(alpha,ex,ey,unused)写 SSBO，像素颜色写 pcol，原子累加 loss/像素数
+//   bwd   反传：读 fwd/pcol，加和 backward（逐 splat 独立，无递推），原子加 9 参数梯度，稀疏 touch 收集
 //   adam  稀疏 Adam：只更新本迭代 touch 的 splat（读回 touchCnt 后 dispatch），梯度除 nv，清 grad，累积 gradAcc
 // 每迭代仅上传 nTile*2 个 tile 坐标（KB 级）+ 读回 3 个 uint（loss/nv/touchCnt），无大传输；
 // 密度控制每 100 迭代读回全量参数跑 CPU Densify 后重传（~70MB/100 迭代，摊薄后可忽略）。
@@ -618,10 +798,11 @@ layout(std430,binding=3) buffer BOff { uint off[]; };
 layout(std430,binding=4) buffer BCnt { uint cnt[]; };
 layout(std430,binding=5) buffer BIdx { uint idx[]; };
 layout(std430,binding=6) buffer BTxy { uint txy[]; };      // nTile*2 tile 坐标
-layout(std430,binding=7) buffer BFwd { float fwd[]; };     // seq*(uMaxPl*4): (alpha,T,ex,ey)
+layout(std430,binding=7) buffer BFwd { float fwd[]; };     // seq*(uMaxPl*4): (alpha,T,ex,ey)  T 加和模式恒 1.0
 layout(std430,binding=8) buffer BPc  { float pcol[]; };    // seq*3: 像素颜色
 layout(std430,binding=11) buffer BStat { uint stat[]; };
 uniform uint uImgW, uImgH, uTCOLS, uMaxPl;
+uniform int uModel;   // 1=加和，0=alpha 合成
 float SigmoidF(float x){ return 1.0f/(1.0f+exp(-x)); }
 void main(){
   uint wg = gl_WorkGroupID.x;
@@ -634,7 +815,8 @@ void main(){
   uint seq = wg*64u + t;
   if (px >= uImgW || py >= uImgH) return;
   float cx = float(px)+0.5f, cy = float(py)+0.5f;
-  float T = 1.0f; vec3 acc = vec3(0.0f);
+  vec3 acc = vec3(0.0f);
+  float T = 1.0f;
   uint fbase = seq*uMaxPl*4u;
   for (uint k=0u;k<n;++k){
     uint gi = idx[base+k];
@@ -654,8 +836,12 @@ void main(){
     float alpha=a*gv;
     uint fp=fbase+k*4u;
     fwd[fp]=alpha; fwd[fp+1u]=T; fwd[fp+2u]=ex; fwd[fp+3u]=ey;
-    acc += vec3(r,g,b)*(alpha*T);
-    T *= 1.0f-alpha;
+    if (uModel == 1) {
+      acc += vec3(r,g,b)*alpha;          // 加和：顺序无关，无 transmittance
+    } else {
+      acc += vec3(r,g,b)*(alpha*T);
+      T *= 1.0f-alpha;
+    }
   }
   acc = clamp(acc, 0.0f, 1.0f);
   pcol[seq*3u]=acc.x; pcol[seq*3u+1u]=acc.y; pcol[seq*3u+2u]=acc.z;
@@ -670,7 +856,7 @@ void main(){
 }
 )GLSL";
 
-// 反传：与 CPU BackwardPixel2 完全一致的 alpha 合成 backward 递推 + 9 参数解析梯度。
+// 反传：与 CPU BackwardPixel2 完全一致（加和逐 splat 独立 / alpha 逆序 T 递推）+ 9 参数解析梯度。
 // 注意：Intel 核显 GLSL 4.30 不支持 float atomicAdd（GL_ARB_shader_atomic_float 未启用），
 // 梯度用 int32 定点（×65536）原子累加，Adam pass 转回 float——精度 1.5e-5，足够训练。
 static const char* kGpuTrainBwd = R"GLSL(
@@ -690,7 +876,7 @@ layout(std430,binding=11) buffer BStat { uint stat[]; };
 layout(std430,binding=12) buffer BMark { uint mark[]; };
 layout(std430,binding=13) buffer BTch  { uint tch[]; };
 uniform uint uImgW, uImgH, uTCOLS, uMaxPl;
-uniform int uL2;
+uniform int uL2, uModel;
 float SigmoidF(float x){ return 1.0f/(1.0f+exp(-x)); }
 void main(){
   uint wg=gl_WorkGroupID.x, t=gl_LocalInvocationIndex;
@@ -712,7 +898,8 @@ void main(){
   uint fbase=seq*uMaxPl*4u;
   float gradT=0.0f;
   for (uint i2=0u;i2<n;++i2){
-    uint ii=n-1u-i2;
+    // 加和模型顺序无关：正序即可；alpha 合成必须逆序递推 gradT
+    uint ii = (uModel == 1) ? i2 : n-1u-i2;
     uint gi=idx[base+ii];
     uint g9=gi*9u;
     uint fp=fbase+ii*4u;
@@ -720,17 +907,22 @@ void main(){
     float a=SigmoidF(p[g9+8u]);
     float r=clamp(p[g9+5u],0.0f,1.0f), g=clamp(p[g9+6u],0.0f,1.0f), b=clamp(p[g9+7u],0.0f,1.0f);
     float eC=eR*r+eG*g+eB*b;
-    float dAlp=eC*Ti-gradT*Ti;
-    float dTi=eC*alp+gradT*(1.0f-alp);
-    gradT=dTi;
+    float dAlp;
+    if (uModel == 1) {
+      dAlp=eC;   // 加和：∂L/∂α_i = eC，无 transmittance 耦合
+    } else {
+      dAlp=eC*Ti-gradT*Ti;   // alpha：∂L/∂α_i = (eC-gradT)*T_i
+      float dTi=eC*alp+gradT*(1.0f-alp);
+      gradT=dTi;
+    }
     float gv = (a>1e-12f) ? alp/a : 0.0f;
     float dA=dAlp*gv;
     float dG=dAlp*a;
     // 定点 ×256：8 位小数，除以 nv 后截断误差 ~1e-5；比 ×65536 抗早期大 splat 的多像素累加溢出
     atomicAdd(grad[g9+8u], int(dA*a*(1.0f-a)*256.0f));
-    atomicAdd(grad[g9+5u], int(eR*alp*Ti*256.0f));
-    atomicAdd(grad[g9+6u], int(eG*alp*Ti*256.0f));
-    atomicAdd(grad[g9+7u], int(eB*alp*Ti*256.0f));
+    atomicAdd(grad[g9+5u], int(eR*alp*((uModel==1)?1.0f:Ti)*256.0f));
+    atomicAdd(grad[g9+6u], int(eG*alp*((uModel==1)?1.0f:Ti)*256.0f));
+    atomicAdd(grad[g9+7u], int(eB*alp*((uModel==1)?1.0f:Ti)*256.0f));
     float w=dG*gv;
     if (w!=0.0f){
       float cs=cos(p[g9+4u]), sn=sin(p[g9+4u]);
@@ -841,11 +1033,16 @@ static GLuint GpuCompile(const char* src, const char* name) {
 // GPU 训练主循环：正传/反传/Adam 全部在 compute shader 执行，CPU 只做 tile 采样、
 // 密度控制（每 100 迭代读回跑 Densify）与进度显示。结束后把参数写回全局 splats。
 static void GpuTrainLoop(int startIt, int iters, int nTile, size_t maxK, int previewPct,
-                         const std::string& ckptPath, int ckptEvery, int l2loss, std::mt19937& rng) {
+                         const std::string& ckptPath, int ckptEvery, int l2loss, std::mt19937& rng,
+                         int prog, int initK) {
     const int TSg = TS;   // 8x8 训练 tile
     GLFWwindow* win = GpuCreateCtx();
     if (!win) return;
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) { glfwTerminate(); return; }
+
+    // 渐进模式：目标 splat 数从 initK 逐步增长到 maxK（每 100 迭代一批，共 ~20 批）
+    int progK = initK;
+    int progStep = prog ? std::max(1, (int)ceil((double)((int)maxK - initK) / 20)) : 0;
 
     // 编译 4 个 pass
     GLuint progZero = GpuCompile(kGpuTrainZero, "zero");
@@ -897,7 +1094,7 @@ static void GpuTrainLoop(int startIt, int iters, int nTile, size_t maxK, int pre
     mk(BPC, npix * 3 * 4, nullptr);
     mk(BGR, p.size() * 4, nullptr);          // grad 初始 0
     mk(BMM, p.size() * 4, mom.data());
-    mk(BST, 3 * 4, nullptr);
+    mk(BST, 4 * 4, nullptr);          // stat[4] = {loss*1e5, l2*1e5, nv, touchCnt}（4 个 uint，勿缩）
     mk(BMK, (size_t)NS * 4, nullptr);
     mk(BTC, (size_t)NS * 4, nullptr);
     mk(BGA, ga.size() * 4, ga.data());
@@ -909,10 +1106,11 @@ static void GpuTrainLoop(int startIt, int iters, int nTile, size_t maxK, int pre
 
     // uniform 定位
     GLuint uF_W=glGetUniformLocation(progFwd,"uImgW"), uF_H=glGetUniformLocation(progFwd,"uImgH"),
-           uF_T=glGetUniformLocation(progFwd,"uTCOLS"), uF_M=glGetUniformLocation(progFwd,"uMaxPl");
+           uF_T=glGetUniformLocation(progFwd,"uTCOLS"), uF_M=glGetUniformLocation(progFwd,"uMaxPl"),
+           uF_Md=glGetUniformLocation(progFwd,"uModel");
     GLuint uB_W=glGetUniformLocation(progBwd,"uImgW"), uB_H=glGetUniformLocation(progBwd,"uImgH"),
            uB_T=glGetUniformLocation(progBwd,"uTCOLS"), uB_M=glGetUniformLocation(progBwd,"uMaxPl"),
-           uB_L=glGetUniformLocation(progBwd,"uL2");
+           uB_L=glGetUniformLocation(progBwd,"uL2"), uB_Md=glGetUniformLocation(progBwd,"uModel");
     GLuint uZ_N=glGetUniformLocation(progZero,"uN");
     GLuint uA_T=glGetUniformLocation(progAdam,"uTouch"), uA_I=glGetUniformLocation(progAdam,"uInvNv"),
            uA_L=glGetUniformLocation(progAdam,"uLrScale"), uA_C1=glGetUniformLocation(progAdam,"uBc1"),
@@ -928,10 +1126,12 @@ static void GpuTrainLoop(int startIt, int iters, int nTile, size_t maxK, int pre
         glUseProgram(progFwd);
         glUniform1ui(uF_W, (GLuint)W); glUniform1ui(uF_H, (GLuint)H);
         glUniform1ui(uF_T, (GLuint)TCOLS); glUniform1ui(uF_M, maxPl);
+        glUniform1i(uF_Md, g_model);
         glUseProgram(progBwd);
         glUniform1ui(uB_W, (GLuint)W); glUniform1ui(uB_H, (GLuint)H);
         glUniform1ui(uB_T, (GLuint)TCOLS); glUniform1ui(uB_M, maxPl);
         glUniform1i(uB_L, l2loss);
+        glUniform1i(uB_Md, g_model);
         glUseProgram(progAdam);
         glUniform1ui(uA_W, (GLuint)W); glUniform1ui(uA_H, (GLuint)H);
     };
@@ -950,9 +1150,12 @@ static void GpuTrainLoop(int startIt, int iters, int nTile, size_t maxK, int pre
         for (int b = 0; b < nTile; ++b) { txy[(size_t)b * 2] = (uint32_t)txr(rng); txy[(size_t)b * 2 + 1] = (uint32_t)tyr(rng); }
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, sbo[BTX]);
         glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(txy.size() * 4), txy.data());
-        // 2) zero -> fwd -> bwd -> adam
+        // 2) zero -> fwd -> bwd -> adam（每个 dispatch 间加 barrier，保证前一个 pass 的
+        //    SSBO 写入对下一个 pass 可见；缺 barrier 在部分驱动上 stat/fwd 数据错乱）
         glUseProgram(progZero); glDispatchCompute((GLuint)((NS + 255) / 256), 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         glUseProgram(progFwd);  glDispatchCompute((GLuint)nTile, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         glUseProgram(progBwd);  glDispatchCompute((GLuint)nTile, 1, 1);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         // 3) 读回统计（loss/l2/nv/touchCnt）：glFinish 等 fwd/bwd 写完 stat 再 map 读
@@ -1030,7 +1233,8 @@ static void GpuTrainLoop(int startIt, int iters, int nTile, size_t maxK, int pre
                 gradAcc[i][0] = ga[(size_t)i * 2]; gradAcc[i][1] = ga[(size_t)i * 2 + 1];
                 for (int c = 0; c < 9; ++c) { mAdam[i][c] = mom[(size_t)i * 9 + c]; vAdam[i][c] = vel[(size_t)i * 9 + c]; }
             }
-            Densify(maxK, rng);
+            Densify(prog ? (size_t)progK : maxK, rng, prog != 0);
+            if (prog) progK = std::min((int)maxK, progK + progStep);
             for (auto& g : gradAcc) { g[0] = 0; g[1] = 0; }
             BuildTileMap(splats, TSg, tMap);
             TCOLS = tMap.TCOLS;
@@ -1066,8 +1270,8 @@ static void GpuTrainLoop(int startIt, int iters, int nTile, size_t maxK, int pre
                 maxPlInit = maxPl;
             }
             glUniform1ui(uZ_N, (GLuint)NS);
-            glUseProgram(progFwd); glUniform1ui(uF_T, (GLuint)TCOLS); glUniform1ui(uF_M, maxPl);
-            glUseProgram(progBwd); glUniform1ui(uB_T, (GLuint)TCOLS); glUniform1ui(uB_M, maxPl);
+            glUseProgram(progFwd); glUniform1ui(uF_T, (GLuint)TCOLS); glUniform1ui(uF_M, maxPl); glUniform1i(uF_Md, g_model);
+            glUseProgram(progBwd); glUniform1ui(uB_T, (GLuint)TCOLS); glUniform1ui(uB_M, maxPl); glUniform1i(uB_Md, g_model);
             glUseProgram(progAdam); glUniform1ui(uA_W, (GLuint)W); glUniform1ui(uA_H, (GLuint)H);
             printf("\n[gputrain] 密度控制 iter=%d splats=%d\n", it, NS);
         }
@@ -1150,6 +1354,8 @@ int main(int argc, char** argv) {
     int    residual = 0;     // embed 产物附加"残差修正层"（4bit/通道 ±64，叠加补高频细节，可再提 ~7dB）
     int    gpu = 0;          // 1=训练完成后跑 GPU 前向 tile 渲染基准（OpenGL 4.3 compute，需核显支持）
     int    gputrain = 0;     // 1=训练模式切到 GPU compute（正传/反传/Adam 全 GPU，密度控制 CPU 化）
+    int    initMode = 0;     // 0=网格（默认） 1=梯度引导（内容自适应，细节区集中分配）
+    int    prog = 0;         // 1=误差引导渐进优化（初始 50% splat，逐步在欠拟合区补残差 splat，预算=--splats）
     float  bg     = 0.0f;
     float  targetPsnr = 0.0f;   // --target：EMA PSNR 达到该值即提前停止训练（0 = 不启用）
     std::string outPath = "fitsplat.glsl";
@@ -1179,6 +1385,10 @@ int main(int argc, char** argv) {
         else if (k == "--tilecap")  tilecap = atoi(next()); // 输出 tile 索引上限（0=不截断）
         else if (k == "--residual") residual = atoi(next()); // 1=embed 产物附带残差修正层
         else if (k == "--gpu")      gpu = atoi(next());       // 1=训练完成后跑 GPU 前向 tile 渲染基准
+        else if (k == "--init")     initMode = atoi(next());  // 0=网格 1=梯度引导（内容自适应）
+        else if (k == "--prog")     prog = atoi(next());      // 1=误差引导渐进优化
+        else if (k == "--init-scale") gInitScale = (float)atof(next());  // 初始高斯尺度（像素）
+        else if (k == "--model")    g_model = atoi(next());   // 渲染模型：1=加和（默认），0=alpha 合成
         else if (k == "--dump-target") dumpTarget = atoi(next());
         else { printf("未知参数: %s\n", k.c_str()); return 1; }
     }
@@ -1247,26 +1457,31 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ---------- 初始化：网格铺开 ----------
+    // ---------- 初始化：网格铺开 / 梯度引导（内容自适应） ----------
     std::mt19937 rng((unsigned)seed);
-    int n = (int)ceil(sqrt((double)K0));
-    float cellX = (float)W / n, cellY = (float)H / n;
+    int initK = prog ? std::max(16, (int)ceil(K0 * 0.5)) : K0;   // 渐进模式先只铺 50%
     splats.clear(); mAdam.clear(); vAdam.clear(); gradAcc.clear();
-    for (int j = 0; j < n; ++j) {
-        for (int i = 0; i < n; ++i) {
-            Splat s;
-            s.mx = (i + 0.5f) * cellX; s.my = (j + 0.5f) * cellY;
-            s.sx = 1.1f * cellX;       s.sy = 1.1f * cellY;
-            s.rot = 0.0f;
-            size_t k = ((size_t)(int)s.my * W + (int)s.mx) * 3;
-            k = std::min(k, target.size() - 3);
-            s.r = ClampF(target[k], 0, 1); s.g = ClampF(target[k + 1], 0, 1); s.b = ClampF(target[k + 2], 0, 1);
-            s.a = valid[(size_t)(int)s.my * W + (int)s.mx] ? 0.5f : 0.01f;   // 透明区域 splat 初始近透明，密度控制会快速删除
-            s.r2 = (3.0f * std::max(s.sx, s.sy)) * (3.0f * std::max(s.sx, s.sy));
-            splats.push_back(s);
-            mAdam.push_back(std::array<float, 9>{});
-            vAdam.push_back(std::array<float, 9>{});
-            gradAcc.push_back(std::array<float, 2>{});
+    if (initMode == 1) {
+        InitSplatGradient(initK, rng);
+    } else {
+        int n = (int)ceil(sqrt((double)initK));
+        float cellX = (float)W / n, cellY = (float)H / n;
+        for (int j = 0; j < n; ++j) {
+            for (int i = 0; i < n; ++i) {
+                Splat s;
+                s.mx = (i + 0.5f) * cellX; s.my = (j + 0.5f) * cellY;
+                s.sx = 1.1f * cellX;       s.sy = 1.1f * cellY;
+                s.rot = 0.0f;
+                size_t k = ((size_t)(int)s.my * W + (int)s.mx) * 3;
+                k = std::min(k, target.size() - 3);
+                s.r = ClampF(target[k], 0, 1); s.g = ClampF(target[k + 1], 0, 1); s.b = ClampF(target[k + 2], 0, 1);
+                s.a = valid[(size_t)(int)s.my * W + (int)s.mx] ? 0.5f : 0.01f;   // 透明区域 splat 初始近透明，密度控制会快速删除
+                s.r2 = (3.0f * std::max(s.sx, s.sy)) * (3.0f * std::max(s.sx, s.sy));
+                splats.push_back(s);
+                mAdam.push_back(std::array<float, 9>{});
+                vAdam.push_back(std::array<float, 9>{});
+                gradAcc.push_back(std::array<float, 2>{});
+            }
         }
     }
 
@@ -1384,7 +1599,10 @@ int main(int argc, char** argv) {
     float lossEma = 0, mseEma = 0;
     int   prevPct = -1, prevBmpPct = -1;
     int   lastPct10 = 0;   // --target 检查点：每跨过总迭代 10% 检查一次（固定 10 次全图评估，与迭代总数无关）
-    size_t maxK = (size_t)(K0 * 3.0);   // 密度控制上限放宽到 3x（接近无损复刻需要更大 splat 规模）
+    // 密度控制上限：非渐进 = 3x 初始（现有语义）；渐进模式 --splats 即总预算，目标从 50% 逐步长到 K0
+    size_t maxK = (size_t)(prog ? K0 : K0 * 3);
+    int progK = initK;   // 渐进模式当前目标 splat 数（每 100 迭代增长一批）
+    int progStep = prog ? std::max(1, (int)ceil((double)((int)maxK - initK) / 20)) : 0;
 
     // tile 分块（训练核心加速：每像素只遍历本 tile 的 splat，剔除 99% 无关 splat）
     TileMap tMap;
@@ -1396,7 +1614,7 @@ int main(int argc, char** argv) {
     for (int it = startIt + 1; it <= iters; ++it) {
         // GPU 训练模式：正传/反传/Adam 全部在 compute shader 执行，跑完后直接收尾
         if (gputrain) {
-            GpuTrainLoop(startIt, iters, nTile, maxK, previewPct, ckptPath, ckptEvery, l2loss, rng);
+            GpuTrainLoop(startIt, iters, nTile, maxK, previewPct, ckptPath, ckptEvery, l2loss, rng, prog, initK);
             it = iters;   // 循环结束（GpuTrainLoop 内部跑完所有迭代）
             break;
         }
@@ -1610,7 +1828,8 @@ int main(int argc, char** argv) {
 
         // 密度控制
         if (it % 100 == 0) {
-            Densify(maxK, rng);
+            Densify(prog ? (size_t)progK : maxK, rng, prog != 0);
+            if (prog) progK = std::min((int)maxK, progK + progStep);
             for (auto& ga : gradAcc) { ga[0] = 0; ga[1] = 0; }
             for (auto& tg : tGrads) tg.assign(splats.size(), std::array<float, 9>{});
             for (auto& tk : touched) tk.clear();             // splat 数量/顺序变化，重建稀疏结构
@@ -1689,7 +1908,9 @@ int main(int argc, char** argv) {
         if (fopen_s(&f, outPath.c_str(), "w") == 0 && f) {
             fprintf(f, "#version 330 core\nout vec4 FragColor;\n\n");
             fprintf(f, "uniform vec2  iResolution;\nuniform float iTime;\n\n");
-            fprintf(f, "// 由 fitsplat 生成：%d 个高斯泼溅（alpha 合成 + tile 分块剔除）拟合图片\n", (int)splats.size());
+            fprintf(f, "// MODEL=%s\n", g_model == 1 ? "additive" : "alpha");   // fitsplat_gl 按此标识自动选择混合方式
+            fprintf(f, "// 由 fitsplat 生成：%d 个高斯泼溅（%s + tile 分块剔除）拟合图片\n",
+                    (int)splats.size(), g_model == 1 ? "加和模型" : "alpha 合成模型");
             if (embed) {
                 // 位置量化系数按画布自适应：16bit 需覆盖 [0,W]/[0,H]。
                 // 旧版固定 128/64（mx 上限 512px、my 上限 1024px），大画布（如 800x1165）会
@@ -1774,7 +1995,7 @@ int main(int argc, char** argv) {
             if (embed) {
                 fprintf(f, "    uvec2 oc = kTileOff[ti];\n");
                 fprintf(f, "    vec3 acc = vec3(0.0);\n");
-                fprintf(f, "    float T = 1.0;\n");
+                if (g_model == 0) fprintf(f, "    float T = 1.0;\n");
                 fprintf(f, "    for (uint k = 0u; k < oc.y; ++k){\n");
                 fprintf(f, "        int si = int(kTileIdx[int(oc.x) + int(k)]);\n");
                 fprintf(f, "        uint u0 = kData[si*4], u1 = kData[si*4+1], u2 = kData[si*4+2], u3 = kData[si*4+3];\n");
@@ -1787,7 +2008,7 @@ int main(int argc, char** argv) {
             } else {
                 fprintf(f, "    uvec2 oc = texelFetch(uTileOff, ivec2(ti,0), 0).xy;\n");
                 fprintf(f, "    vec3 acc = vec3(0.0);\n");
-                fprintf(f, "    float T = 1.0;\n");
+                if (g_model == 0) fprintf(f, "    float T = 1.0;\n");
                 fprintf(f, "    for (uint k = 0u; k < oc.y; ++k){\n");
                 fprintf(f, "        int si = int(texelFetch(uTileIdx, ivec2(int(oc.x)+int(k),0), 0).x);\n");
                 fprintf(f, "        vec4 sa = texelFetch(uSplatA, ivec2(si,0), 0);\n");
@@ -1799,8 +2020,12 @@ int main(int argc, char** argv) {
             fprintf(f, "        float ey = (-sc.y*d.x + sc.x*d.y) / sa.w;\n");
             fprintf(f, "        float g = exp(-0.5*(ex*ex + ey*ey));\n");
             fprintf(f, "        float al = sb.w * g;\n");
-            fprintf(f, "        acc += sb.rgb * (al * T);\n");
-            fprintf(f, "        T *= (1.0 - al);\n");
+            if (g_model == 1) {
+                fprintf(f, "        acc += sb.rgb * al;   // 加和：顺序无关，无 transmittance\n");
+            } else {
+                fprintf(f, "        acc += sb.rgb * (al * T);\n");
+                fprintf(f, "        T *= (1.0 - al);\n");
+            }
             fprintf(f, "    }\n");
             if (residual) {
                 fprintf(f, "    uint rv = kRes[int(clamp(p.y, 0.0, IMG_H - 1.0)) * IMG_WI + int(clamp(p.x, 0.0, IMG_W - 1.0))];\n");
